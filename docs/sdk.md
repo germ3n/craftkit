@@ -443,6 +443,7 @@ scripts/sync_craftkit.sh            # re-export into ~/craftkit, commit with lod
 scripts/sync_craftkit.sh ~/elsewhere   # another clone; cloned first when it is not one yet
 ```
 
-It commits nothing when nothing changed. `scripts/export_craftkit.py <destination>` alone writes
+It commits nothing when nothing changed, and refuses while `sdk/`, `host/` or this guide has changes
+lodger has not committed, so only committed work goes over. `scripts/export_craftkit.py <destination>` alone writes
 the export without committing.
 
