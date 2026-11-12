@@ -186,6 +186,11 @@ pub struct Event {
     pub detail: String,
     /// A container's contents, for `OpenedContainer`.
     pub contents: Vec<ItemStack>,
+    /// A container's slots, for `OpenedContainer` and `ClosedContainer`: 54 for a double chest,
+    /// which is reported whole and always at the same half, whichever is clicked; 0 when unknown.
+    /// ABI 55.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub size: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,7 +363,8 @@ pub enum Command {
         player: u32,
         text: String,
     },
-    /// Open or close a door, trapdoor or gate, flip a lever, press a button.
+    /// Open or close a door, trapdoor or gate, flip a lever, press a button; a crafter crafts
+    /// once, as a pulse would make it (ABI 55).
     ToggleBlock {
         id: u64,
         pos: BlockPos,
@@ -411,7 +417,8 @@ pub enum Command {
         only: bool,
     },
     /// Put another block in a block's place, keeping every property the two share (a wall
-    /// torch's facing, a lantern's hanging), and only over one of `only`: a torch's flame turned
+    /// torch's facing, a lantern's hanging), a pane, bars or a fence joined to its neighbours
+    /// afresh (ABI 55), and only over one of `only`: a torch's flame turned
     /// to soul fire where it hangs. ABI 24.
     SwapBlock {
         id: u64,
@@ -442,8 +449,8 @@ pub enum Command {
         pos: BlockPos,
         block: String,
     },
-    /// Place an entity of kind `of` at `pos` facing `yaw`: an armour stand, a farm animal, or a
-    /// bat (ABI 54). With
+    /// Place an entity of kind `of` at `pos` facing `yaw`: an armour stand, a farm animal, a
+    /// bat (ABI 54), or a copper golem (ABI 55). With
     /// `seconds` above 0 it is there for that long only, then gone, and gone at once when its
     /// level saves or closes, or when next seen after a quit. ABI 27.
     PlaceEntity {
@@ -461,7 +468,7 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         face: Option<u32>,
         /// A hostile one set on this player (a silverfish, a cave spider, a wolf, a zombie, a
-        /// vex, a phantom): it may be killed, and is gone with nothing dropped; its hits never
+        /// vex, a phantom, a creaking from ABI 55): it may be killed, and is gone with nothing dropped; its hits never
         /// kill (the player is left at half a heart). With `seconds` above 0 only. ABI 54.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         targets: Option<u32>,
@@ -662,6 +669,40 @@ pub enum Command {
     Spare {
         id: u64,
         on: bool,
+    },
+    /// `block` (`minecraft:suspicious_sand` over natural ground, or `minecraft:decorated_pot`
+    /// on it) at `pos` (counted from the ground below -1000, as `set_block`'s), holding the stack
+    /// kept under `kept` (`take_item`'s `keep`): brushed or broken, it gives it back. Only into air
+    /// or over sand, dirt or grass; the stack stays kept when it cannot go. ABI 55.
+    KeepIn {
+        id: u64,
+        pos: BlockPos,
+        block: String,
+        kept: String,
+    },
+    /// The game's breaking cracks over the block at `pos` on `player`'s client alone, at `stage`
+    /// (0, the first, to 9, nearly broken; below 0, gone); the block itself is never touched.
+    /// ABI 55.
+    CrackBlock {
+        id: u64,
+        player: u32,
+        pos: BlockPos,
+        stage: i32,
+    },
+    /// The big dripleaves near `player` (ten blocks), up to six, tipped one after another from
+    /// the farthest in, as if something walked across them toward them, each with its sound, and
+    /// up again a moment on; refused when there are none. ABI 55.
+    TipDripleaves {
+        id: u64,
+        player: u32,
+    },
+    /// A boss bar named `name` at the top of `player`'s screen alone, filling from empty over
+    /// `seconds` (ninety at most), then gone. ABI 55.
+    BossBar {
+        id: u64,
+        player: u32,
+        name: String,
+        seconds: f32,
     },
     /// Every wall torch among `torches` turned on its block to point as nearly at `toward` as a
     /// wall there lets it, lit or not as it was; anything else among them left as it is. Reports
@@ -1474,7 +1515,8 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         finds: String,
         /// Sitting on a mount of this kind placed under it for its time, standing still
-        /// (`minecraft:skeleton_horse`, `minecraft:zombie_horse`, `minecraft:horse`; ABI 55).
+        /// (`minecraft:skeleton_horse`, `minecraft:zombie_horse`, `minecraft:horse`,
+        /// `minecraft:happy_ghast`, held in the air where it is set; ABI 55).
         #[serde(default, skip_serializing_if = "String::is_empty")]
         mount: String,
     },
@@ -1528,6 +1570,10 @@ impl Command {
             | Command::Circle { id, .. }
             | Command::FakeCreeper { id, .. }
             | Command::TurnTorches { id, .. }
+            | Command::BossBar { id, .. }
+            | Command::KeepIn { id, .. }
+            | Command::TipDripleaves { id, .. }
+            | Command::CrackBlock { id, .. }
             | Command::Spare { id, .. }
             | Command::VillagerFleesIn { id, .. }
             | Command::DeadRedstone { id, .. }

@@ -64,6 +64,12 @@ import java.util.Set;
  *   <li>{@code clock_wrong}: a clock shows the time half a day off ({@code ClockTimeMixin}).</li>
  *   <li>{@code phantom_item}: the first time they open their inventory while it lasts, a paper
  *       named "behind you" in an empty slot for three seconds ({@code InventoryScreenMixin}).</li>
+ *   <li>{@code prints_on_the_ceiling}: dark footprints upside down on the ceiling, from the
+ *       place in its detail to the hint's ({@link CeilingPrints}), renewed while it lasts.</li>
+ *   <li>{@code spyglass_figure}: while they scope, far off where they look, a figure looking back,
+ *       gone when they lower the glass ({@link SpyglassFigure}).</li>
+ *   <li>{@code rustle_in_the_pack}: the first time they open their inventory while it lasts,
+ *       a bundle's rustle, once, though they carry none ({@code InventoryScreenMixin}).</li>
  *   <li>{@code border_closes}: the world border on their client drawn close round them, then
  *       put back as it was.</li>
  *   <li>{@code shadow_on_the_wall}: while they hold a light indoors, a person's shadow on the
@@ -174,6 +180,7 @@ public final class Glitches {
 		boolean shaking = false;
 		boolean rumbling = false;
 		boolean bordered = false;
+		boolean spying = false;
 		long now = System.currentTimeMillis();
 		for (Hints.Active active : Hints.active()) {
 			HintPayload hint = active.hint();
@@ -294,7 +301,7 @@ public final class Glitches {
 					var random = minecraft.level.getRandom();
 					// Banks of it low over the ground, big soft drifts (seen with a shader pack on
 					// too, which hides the game's fog), and the motes in it.
-					int banks = (int) (w * 6);
+					int banks = MistVeil.banks(w, shadersOn());
 					for (int i = 0; i < banks; i++) {
 						double x = minecraft.player.getX() + random.nextDouble() * 28 - 14;
 						double y = minecraft.player.getY() + random.nextDouble() * 1.6 - 0.3;
@@ -414,11 +421,21 @@ public final class Glitches {
 						shadow(minecraft, active);
 					}
 				}
+				// Footprints walking the ceiling, from the door to over the bed, every half second.
+				case "prints_on_the_ceiling" -> {
+					if (minecraft.level.getGameTime() % 10 == 0) {
+						hint.pos().ifPresent(to -> ceilingPrints(minecraft, hint.detail(), to));
+					}
+				}
 				// Red specks from the door to the bed, on the floor, every half second.
 				case "red_trail" -> {
 					if (minecraft.level.getGameTime() % 10 == 0) {
 						hint.pos().ifPresent(from -> redTrail(minecraft, from, hint.detail()));
 					}
+				}
+				case "spyglass_figure" -> {
+					spying = true;
+					SpyglassFigure.tick(minecraft, active.id());
 				}
 				// A puff of breath before their face every two seconds.
 				case "cold_breath" -> {
@@ -468,6 +485,9 @@ public final class Glitches {
 
 		if (!behind) {
 			BehindFigure.clear(minecraft);
+		}
+		if (!spying) {
+			SpyglassFigure.clear(minecraft);
 		}
 		if (!bordered && borderBefore != null) {
 			var border = minecraft.level.getWorldBorder();
@@ -648,6 +668,41 @@ public final class Glitches {
 		}
 	}
 
+	/** The ceiling prints from the place in `from` ("x,y,z") to `to`, each under the first solid block over it. */
+	private static void ceilingPrints(Minecraft minecraft, String from, net.minecraft.core.BlockPos to) {
+		String[] parts = from.split(",");
+		if (parts.length != 3) {
+			return;
+		}
+		int fx;
+		int fy;
+		int fz;
+		try {
+			fx = Integer.parseInt(parts[0]);
+			fy = Integer.parseInt(parts[1]);
+			fz = Integer.parseInt(parts[2]);
+		} catch (NumberFormatException e) {
+			return;
+		}
+		for (CeilingPrints.Step step : CeilingPrints.steps(fx + 0.5, fz + 0.5, to.getX() + 0.5, to.getZ() + 0.5)) {
+			double ceiling = Double.NaN;
+			for (int up = 1; up <= 8; up++) {
+				net.minecraft.core.BlockPos at = net.minecraft.core.BlockPos.containing(step.x(), fy + up, step.z());
+				if (!minecraft.level.getBlockState(at).getCollisionShape(minecraft.level, at).isEmpty()) {
+					ceiling = at.getY() - 0.02;
+					break;
+				}
+			}
+			if (Double.isNaN(ceiling)) {
+				continue;
+			}
+			for (double[] d : FootPrint.dots(step.yaw())) {
+				minecraft.level.addParticle(new net.minecraft.core.particles.DustParticleOptions(0x2E2218, 0.4f),
+						step.x() + d[0], ceiling, step.z() + d[1], 0, 0, 0);
+			}
+		}
+	}
+
 	/** Red specks on the floor along the way from `from` to the place in `to` ("x,y,z"). */
 	private static void redTrail(Minecraft minecraft, net.minecraft.core.BlockPos from, String to) {
 		String[] parts = to.split(",");
@@ -713,6 +768,21 @@ public final class Glitches {
 				graphics.setTooltipForNextFrame(Minecraft.getInstance().font, paper, mouseX, mouseY);
 			}
 			return;
+		}
+	}
+
+	/** `rustle_in_the_pack`: the inventory open, a bundle's rustle once a hint. */
+	public static void inventoryOpen() {
+		for (Hints.Active active : Hints.active()) {
+			if (active.hint().hint().equals("rustle_in_the_pack")) {
+				once(active, () -> {
+					var minecraft = Minecraft.getInstance();
+					if (minecraft.player != null && minecraft.level != null) {
+						minecraft.level.playLocalSound(minecraft.player.getX(), minecraft.player.getY(), minecraft.player.getZ(),
+								net.minecraft.sounds.SoundEvents.BUNDLE_INSERT, SoundSource.PLAYERS, 0.8f, 0.8f, false);
+					}
+				});
+			}
 		}
 	}
 

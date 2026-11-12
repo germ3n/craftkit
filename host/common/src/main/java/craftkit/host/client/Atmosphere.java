@@ -16,14 +16,22 @@ public final class Atmosphere {
 	public record Fog(float start, float end, float r, float g, float b) {
 	}
 
-	/** Mist: pale grey, close. */
-	public static final Fog MIST = new Fog(0, 13, 0.74f, 0.76f, 0.80f);
+	/** Mist: pale grey, close; 22 blocks out (13 was a whiteout without a shader pack, owner: "i can hardly see anything"). */
+	public static final Fog MIST = new Fog(0, 22, 0.74f, 0.76f, 0.80f);
 	/** Red mist: deep red, a little farther. */
 	public static final Fog RED_MIST = new Fog(0, 20, 0.42f, 0.04f, 0.04f);
 	/** Darkness: black, a few blocks. */
 	public static final Fog DARKNESS = new Fog(0, 7, 0.0f, 0.0f, 0.0f);
 	/** Dusk at noon: the light drained, grey-violet, the distance gone. */
 	public static final Fog DUSK = new Fog(4, 44, 0.22f, 0.20f, 0.27f);
+
+	/**
+	 * Whether a hint turns this compass to its place: `compass_points` any compass, as it did;
+	 * `recovery_compass_lies` a recovery compass alone, which then points not at where they died.
+	 */
+	public static boolean pointsAway(String hint, boolean recovery) {
+		return hint.equals("compass_points") || (recovery && hint.equals("recovery_compass_lies"));
+	}
 
 	/** The fog an atmosphere's hint stands for, or null for none. The old `fog_close` is mist now. */
 	public static Fog of(String hint) {

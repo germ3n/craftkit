@@ -148,6 +148,28 @@ public final class Executors {
 					yield report(id, placed, placed ? "" : "no villager could be made");
 				}
 				case "turn_torches" -> turnTorches(level, command, id);
+				case "keep_in" -> keepIn(level, command, id, data);
+				case "crack_block" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					// The game's own breaking cracks, on their client alone (ABI 55): the stage 0 to 9,
+					// below 0 the cracks gone; the block itself never touched.
+					int stage = command.get("stage").getAsInt();
+					player.connection.send(new net.minecraft.network.protocol.game.ClientboundBlockDestructionPacket(CRACKS_ID,
+							blockPos(command.getAsJsonArray("pos")), stage < 0 ? -1 : Math.min(9, stage)));
+					yield report(id, true, "");
+				}
+				case "tip_dripleaves" -> tipDripleaves(level, command, id, context);
+				case "boss_bar" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					BossBars.show(player, command.get("name").getAsString(), command.get("seconds").getAsFloat());
+					yield report(id, true, "");
+				}
 				case "spare" -> {
 					Spare.set(command.get("on").getAsBoolean());
 					yield report(id, true, "");
@@ -652,6 +674,13 @@ public final class Executors {
 		BlockState state = level.getBlockState(pos);
 		Block block = state.getBlock();
 
+		// A crafter crafts once, as a redstone pulse would make it (ABI 55, `crafter_clicks`):
+		// its own tick, which crafts what its grid makes and drops it out of its face.
+		if (block instanceof net.minecraft.world.level.block.CrafterBlock) {
+			state.tick(level, pos, level.getRandom());
+			return report(id, true, "");
+		}
+
 		if (block instanceof DoorBlock door) {
 			boolean open = to == null ? !door.isOpen(state) : to;
 			if (open == door.isOpen(state)) {
@@ -890,7 +919,7 @@ public final class Executors {
 	}
 
 	/** The mounts a figure may be set on (ABI 55). */
-	private static final List<String> MOUNTS = List.of("minecraft:skeleton_horse", "minecraft:zombie_horse", "minecraft:horse");
+	private static final List<String> MOUNTS = List.of("minecraft:skeleton_horse", "minecraft:zombie_horse", "minecraft:horse", "minecraft:happy_ghast");
 
 	/**
 	 * Where a figure stands in lava: the surface of the nearest still lava with air over it, six
@@ -1107,6 +1136,11 @@ public final class Executors {
 		BlockState swapped = block.get().value().defaultBlockState();
 		for (net.minecraft.world.level.block.state.properties.Property<?> property : there.getProperties()) {
 			swapped = copy(there, swapped, property);
+		}
+		// A pane, bars or a fence joins its neighbours afresh (ABI 55): a pane put back where a
+		// glass block was stood alone, a bare post, its sides not reaching the window's others.
+		if (swapped.getBlock() instanceof net.minecraft.world.level.block.CrossCollisionBlock) {
+			swapped = Block.updateFromNeighbourShapes(swapped, level, pos);
 		}
 		level.setBlock(pos, swapped, Block.UPDATE_ALL);
 
@@ -2592,10 +2626,11 @@ public final class Executors {
 	/** What {@code place_entity} may place: an armour stand, a farm animal, or a bat (`bats_in_the_house`, ABI 54). */
 	private static final List<String> PLACEABLE = List.of("minecraft:armor_stand", "minecraft:cow", "minecraft:pig", "minecraft:sheep",
 			"minecraft:chicken", "minecraft:goat", "minecraft:horse", "minecraft:donkey", "minecraft:mule", "minecraft:llama",
-			"minecraft:rabbit", "minecraft:mooshroom", "minecraft:camel", "minecraft:squid", "minecraft:bat");
+			"minecraft:rabbit", "minecraft:mooshroom", "minecraft:camel", "minecraft:squid", "minecraft:bat",
+			"minecraft:copper_golem");
 	/** The hostiles it may set on a player for a while, spared (ABI 54). */
 	private static final List<String> HOSTILE = List.of("minecraft:silverfish", "minecraft:cave_spider", "minecraft:wolf",
-			"minecraft:zombie", "minecraft:vex", "minecraft:phantom", "minecraft:creeper", "minecraft:killer_bunny");
+			"minecraft:zombie", "minecraft:vex", "minecraft:phantom", "minecraft:creeper", "minecraft:killer_bunny", "minecraft:creaking");
 
 	/** An armour stand or a farm animal placed (ABI 27): for a while when seconds are given, wearing a kept stack when named. */
 	private static JsonObject placeEntity(ServerLevel level, JsonObject command, long id, Context context, WorldData data) {
@@ -2957,6 +2992,106 @@ public final class Executors {
 	}
 
 	/**
+	 * The big dripleaves near a player, up to six, tipped one after another from the farthest in,
+	 * as if something walked across them toward them, each with its sound, and up again a moment
+	 * on (ABI 55). Refused when there are none within ten blocks.
+	 */
+	private static JsonObject tipDripleaves(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		BlockPos at = player.blockPosition();
+		List<BlockPos> leaves = new ArrayList<>();
+		for (BlockPos pos : BlockPos.betweenClosed(at.offset(-10, -4, -10), at.offset(10, 4, 10))) {
+			if (level.isLoaded(pos) && level.getBlockState(pos).getBlock() instanceof net.minecraft.world.level.block.BigDripleafBlock) {
+				leaves.add(pos.immutable());
+			}
+		}
+		if (leaves.isEmpty()) {
+			return report(id, false, "no big dripleaf near");
+		}
+		List<double[]> points = leaves.stream().map(p -> new double[] {p.getX() + 0.5, p.getZ() + 0.5}).toList();
+		List<Integer> order = Toward.order(points, player.getX(), player.getZ(), 6);
+		for (int k = 0; k < order.size(); k++) {
+			BlockPos leaf = leaves.get(order.get(k));
+			context.later().at(k * 0.4f, () -> setTilt(level, leaf, net.minecraft.world.level.block.state.properties.Tilt.FULL, net.minecraft.sounds.SoundEvents.BIG_DRIPLEAF_TILT_DOWN));
+			context.later().at(k * 0.4f + 1.5f, () -> setTilt(level, leaf, net.minecraft.world.level.block.state.properties.Tilt.NONE, net.minecraft.sounds.SoundEvents.BIG_DRIPLEAF_TILT_UP));
+		}
+
+		return report(id, true, "tipped " + order.size());
+	}
+
+	private static void setTilt(ServerLevel level, BlockPos pos, net.minecraft.world.level.block.state.properties.Tilt to, net.minecraft.sounds.SoundEvent sound) {
+		BlockState state = level.getBlockState(pos);
+		var tilt = net.minecraft.world.level.block.state.properties.BlockStateProperties.TILT;
+		if (state.getBlock() instanceof net.minecraft.world.level.block.BigDripleafBlock && state.hasProperty(tilt)) {
+			level.setBlock(pos, state.setValue(tilt, to), Block.UPDATE_CLIENTS);
+			level.playSound(null, pos, sound, net.minecraft.sounds.SoundSource.BLOCKS, 1f, 0.9f);
+		}
+	}
+
+	/** Whose cracks `crack_block`'s are, to the client: a number no entity has. */
+	private static final int CRACKS_ID = -0x4C4F4449;
+
+	/** What `keep_in` may hold a kept stack in. */
+	private static final List<String> KEEPERS = List.of("minecraft:suspicious_sand", "minecraft:decorated_pot");
+
+	/**
+	 * A suspicious sand or a decorated pot holding a kept stack (ABI 55): brushed or broken, it
+	 * gives it back. Into air, or the sand over natural sand, dirt or grass alone; the stack is
+	 * kept still when nothing can go there.
+	 */
+	private static JsonObject keepIn(ServerLevel level, JsonObject command, long id, WorldData data) {
+		String block = command.get("block").getAsString();
+		if (!KEEPERS.contains(block)) {
+			return report(id, false, "not something it keeps things in");
+		}
+		BlockPos pos = onGround(level, blockPos(command.getAsJsonArray("pos")));
+		if (pos == null) {
+			return report(id, false, "the place is not loaded");
+		}
+		List<String> over = block.equals("minecraft:suspicious_sand")
+				? List.of("minecraft:sand", "minecraft:dirt", "minecraft:grass_block", "minecraft:coarse_dirt")
+				: List.of("minecraft:short_grass", "minecraft:snow");
+		String taken = taken(level, pos, over, false);
+		if (taken != null) {
+			return report(id, false, taken);
+		}
+		String key = command.get("kept").getAsString();
+		ItemStack stack = data.giveBack(key);
+		if (stack == null || stack.isEmpty()) {
+			return report(id, false, "nothing kept under " + key);
+		}
+		Optional<Holder.Reference<Block>> kind = BuiltInRegistries.BLOCK.get(Identifier.parse(block));
+		if (kind.isEmpty()) {
+			data.keep(key, stack);
+			return report(id, false, "no such block");
+		}
+		level.setBlock(pos, kind.get().value().defaultBlockState(), Block.UPDATE_ALL);
+		BlockEntity entity = level.getBlockEntity(pos);
+		try {
+			if (entity instanceof net.minecraft.world.level.block.entity.DecoratedPotBlockEntity pot) {
+				pot.setTheItem(stack);
+			} else if (entity instanceof net.minecraft.world.level.block.entity.BrushableBlockEntity sand) {
+				var item = net.minecraft.world.level.block.entity.BrushableBlockEntity.class.getDeclaredField("item");
+				item.setAccessible(true);
+				item.set(sand, stack);
+				sand.setChanged();
+			} else {
+				throw new ReflectiveOperationException("no block entity to hold it");
+			}
+		} catch (ReflectiveOperationException e) {
+			// Nothing to hold it: the block taken back, the stack kept.
+			level.setBlock(pos, net.minecraft.world.level.block.Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL);
+			data.keep(key, stack);
+			return report(id, false, "it could not hold it");
+		}
+
+		return report(id, true, "");
+	}
+
+	/**
 	 * Each wall torch among {@code torches} turned on its block to point as nearly at
 	 * {@code toward} as a wall there lets it (ABI 55): its facing alone changed, lit as it was.
 	 */
@@ -3298,10 +3433,9 @@ public final class Executors {
 		return warped ? report(id, true, "") : report(id, false, "it is held or warped already");
 	}
 
+	/** The container a command names: a double chest whole, as the senses report it (ABI 55). */
 	private static Container container(ServerLevel level, BlockPos pos) {
-		BlockEntity entity = level.getBlockEntity(pos);
-
-		return entity instanceof Container container ? container : null;
+		return Senses.containerAt(level, pos);
 	}
 
 	static BlockPos blockPos(JsonArray array) {
