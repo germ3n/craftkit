@@ -1,0 +1,15 @@
+# The craftkit SDK: the Rust crate mods are written against (sdk/). The Java host that loads
+# them is the Gradle project in host/. Exported from github.com/germ3n/lodger, where both are
+# developed beside their first mod.
+[workspace]
+resolver = "2"
+members = ["sdk"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/germ3n/craftkit"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

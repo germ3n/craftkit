@@ -1,0 +1,3319 @@
+package craftkit.host.world;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import craftkit.host.LoadedMod;
+import craftkit.host.Log;
+import craftkit.host.net.HintPayload;
+import craftkit.host.senses.Senses;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.Holder;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ClientboundSoundPacket;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundSource;
+import net.minecraft.world.Container;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.Mob;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.DoorBlock;
+import net.minecraft.world.level.block.LeverBlock;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.SignBlockEntity;
+import net.minecraft.world.level.block.entity.SignText;
+import net.minecraft.world.level.block.entity.SignTextSlot;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.phys.Vec3;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.function.BiConsumer;
+
+/**
+ * Carries one command out against the level and answers its report. Each command checks what it
+ * needs as it runs ({@code fits}, in the design's words) and reports {@code done} or why not; a
+ * command the host does not know is reported as such rather than dropped, so a mod sees it.
+ *
+ * <p>With {@link Senses}, this is the Minecraft-facing edge of the host: a new game version is
+ * absorbed here and the protocol never moves for it.
+ */
+public final class Executors {
+	/** The most blocks one scan may cover: 40 by 40 by 25, in one tick. */
+	private static final long SCAN_LIMIT = 40_000;
+
+	/** What an executor needs beyond the level: the players by index, the senses to answer into, the hint sender. */
+	public record Context(Senses senses, BiConsumer<ServerPlayer, HintPayload> sendHint, Looks looks, Later later, Poses poses, Figures figures, Holds holds, LootOffers loot, Hidden hidden, Warps warps, Temporaries temporaries, Charges charges, Gatherings gatherings, Footsteps footsteps, Approaches approaches, Shoves shoves, Bobbers bobbers, FrameShows frameShows, Deaths deaths, Fights fights, OtherHouse otherHouse, Eyes eyes, Masks masks, Breaths breaths, MapMarks mapMarks) {
+	}
+
+	private Executors() {
+	}
+
+	public static JsonObject run(LoadedMod mod, ServerLevel level, JsonObject command, Context context, WorldData data) {
+		long id = command.has("id") ? command.get("id").getAsLong() : 0;
+		String kind = command.has("kind") ? command.get("kind").getAsString() : "";
+
+		try {
+			return switch (kind) {
+				case "log" -> {
+					Log.LOGGER.info("{}: {}", mod.id(), command.get("text").getAsString());
+					yield report(id, true, "");
+				}
+				case "system_message" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					player.sendSystemMessage(Component.literal(command.get("text").getAsString()));
+					yield report(id, true, "");
+				}
+				case "play_sound" -> playSound(level, command, id, context);
+				case "hint" -> hint(level, command, id, context);
+				case "scan" -> scan(level, command, id, context);
+				case "surroundings" -> {
+					Surroundings.start(level, mod, id, blockPos(command.getAsJsonArray("around")), command.get("radius").getAsInt(), context.senses());
+					yield report(id, true, "started; the answer comes as an observation");
+				}
+				case "toggle_block" -> toggleBlock(level, blockPos(command.getAsJsonArray("pos")), id,
+						command.has("to") && !command.get("to").isJsonNull() ? command.get("to").getAsBoolean() : null);
+				case "move_block" -> moveBlock(level, command, id);
+				case "set_block" -> setBlock(level, command, id);
+				case "open_lid" -> openLid(level, blockPos(command.getAsJsonArray("pos")), command.get("seconds").getAsFloat(), id, context);
+				case "rotate_frame" -> rotateFrame(level, command, id);
+				case "swap_painting" -> swapPainting(level, command.get("entity").getAsInt(), id);
+				case "pose_stand" -> poseStand(level, command, id, context);
+				case "name_entity" -> nameEntity(level, command.get("entity").getAsInt(), command.get("name").getAsString(), id);
+				case "dye_sheep" -> dyeSheep(level, command.get("entity").getAsInt(), command.get("colour").getAsString(), id);
+				case "move_entity" -> moveEntity(level, command, id, context);
+				case "push_entity" -> pushEntity(level, command, id);
+				case "rotate_block" -> rotateBlock(level, blockPos(command.getAsJsonArray("pos")), id);
+				case "break_block" -> breakBlock(level, blockPos(command.getAsJsonArray("pos")), id);
+				case "set_frame_item" -> setFrameItem(level, command, id);
+				case "equip_entity" -> equipEntity(level, command, id, data);
+				case "damage_item" -> damageItem(level, command, id);
+				case "figure" -> figure(level, command, id, context);
+				case "swap_block" -> swapBlock(level, command, id);
+				case "jukebox" -> jukebox(level, command, id);
+				case "prints" -> prints(level, command, id);
+				case "turn_page" -> turnPage(level, command, id);
+				case "brew" -> brew(level, command, id);
+				case "strip" -> strip(level, command, id);
+				case "shift_bed" -> done(id, Beds.shift(level, blockPos(command.getAsJsonArray("pos"))));
+				case "bed_beside" -> bedBeside(level, command, id);
+				case "hide_block" -> hideBlock(level, command, id, context);
+				case "remove_figure" -> {
+					ServerPlayer player = context.senses().player(level, command.has("player") ? command.get("player").getAsInt() : 0);
+					boolean removed = player != null && context.figures().remove(player, command.get("figure").getAsInt());
+					yield report(id, removed, removed ? "" : "no such figure");
+				}
+				case "player_list" -> playerList(level, command, id, context);
+				case "game_message" -> gameMessage(level, command, id, context);
+				case "move_item" -> moveItem(level, command, id);
+				case "take_item" -> takeItem(level, command, id, data);
+				case "put_item" -> putItem(level, command, id, data);
+				case "drop_item" -> dropItem(level, command, id, data);
+				case "take_up" -> takeUp(level, command, id, data, context);
+				case "snap_branch" -> snapBranch(level, command, id, context);
+				case "bare_tree" -> bareTree(level, command, id);
+				case "fell_tree" -> fellTree(level, command, id, context);
+				case "panic" -> panic(level, command, id, context);
+				case "dead_redstone" -> {
+					BlockPos min = blockPos(command.getAsJsonArray("min"));
+					BlockPos max = blockPos(command.getAsJsonArray("max"));
+					// Walked whole as it begins and ends: no bigger than a scan may read.
+					long volume = (long) (Math.abs(max.getX() - min.getX()) + 1) * (Math.abs(max.getY() - min.getY()) + 1) * (Math.abs(max.getZ() - min.getZ()) + 1);
+					if (volume > SCAN_LIMIT) {
+						yield report(id, false, "the box holds " + volume + " blocks; at most " + SCAN_LIMIT);
+					}
+					DeadRedstone.hold(level, min, max, command.get("seconds").getAsFloat());
+					yield report(id, true, "");
+				}
+				case "villager_flees_in" -> {
+					JsonArray out = command.getAsJsonArray("outside");
+					JsonArray in = command.getAsJsonArray("inside");
+					boolean placed = context.temporaries().fleeIn(level, blockPos(command.getAsJsonArray("door")),
+							new Vec3(out.get(0).getAsDouble(), out.get(1).getAsDouble(), out.get(2).getAsDouble()),
+							new Vec3(in.get(0).getAsDouble(), in.get(1).getAsDouble(), in.get(2).getAsDouble()));
+					yield report(id, placed, placed ? "" : "no villager could be made");
+				}
+				case "turn_torches" -> turnTorches(level, command, id);
+				case "spare" -> {
+					Spare.set(command.get("on").getAsBoolean());
+					yield report(id, true, "");
+				}
+				case "fake_creeper" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					JsonArray p = command.getAsJsonArray("pos");
+					boolean shown = context.figures().fakeCreeper(player, new Vec3(p.get(0).getAsDouble(), p.get(1).getAsDouble(), p.get(2).getAsDouble()));
+					yield report(id, shown, shown ? "" : "no creeper to show");
+				}
+				case "circle" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					String of = command.get("of").getAsString();
+					var type = BuiltInRegistries.ENTITY_TYPE.get(Identifier.parse(of));
+					if (player == null || type.isEmpty() || !List.of("minecraft:wolf").contains(of)) {
+						yield report(id, false, player == null ? "the player is not here" : "not something it circles with");
+					}
+					boolean placed = context.temporaries().circle(level, player, type.get().value(), command.get("count").getAsInt(), command.get("seconds").getAsFloat());
+					yield report(id, placed, placed ? "" : "none could be placed");
+				}
+				case "fake_death" -> {
+					Entity entity = level.getEntity(command.get("entity").getAsInt());
+					Mob mob = entity == null ? null : Senses.mob(entity);
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (mob == null || player == null) {
+						yield report(id, false, mob == null ? "no mob with that id here" : "the player is not here");
+					}
+					if (mob.entityTags().contains(Warps.TAG) || mob.entityTags().contains(Holds.TAG)) {
+						yield report(id, false, "the mob is held or warped");
+					}
+					context.holds().collapse(mob, player, command.get("seconds").getAsFloat());
+					yield report(id, true, "");
+				}
+				case "drop_kept" -> dropKept(level, command, id, data);
+				case "rename_item" -> renameItem(level, command, id);
+				case "sign_book" -> signBook(level, command, id);
+				case "mark_map" -> markMap(level, command, id);
+				case "set_sign" -> setSign(level, command, id);
+				case "cancel_sleep" -> cancelSleep(level, command, id, context);
+				case "look_at" -> lookAt(level, command, id, context);
+				case "hold" -> hold(level, command, id, context);
+				case "warp_mob" -> warpMob(level, command, id, context);
+				case "place_entity" -> placeEntity(level, command, id, context, data);
+				case "release_bees" -> releaseBees(level, command, id, context);
+				case "move_leash" -> moveLeash(level, command, id);
+				case "charge" -> charge(level, command, id, context);
+				case "gather_villagers" -> gatherVillagers(level, command, id, context);
+				case "light_portal" -> lightPortal(level, command, id);
+				case "place_blueprint" -> placeBlueprint(level, command, id);
+				case "figure_swing" -> figureSwing(level, command, id, context);
+				case "choke" -> choke(level, command, id, context);
+				case "hold_door" -> holdDoor(level, command, id, context);
+				case "hold_container" -> {
+					BlockPos pos = blockPos(command.getAsJsonArray("pos"));
+					if (container(level, pos) == null) {
+						yield report(id, false, Senses.blockId(level.getBlockState(pos)) + " is no container");
+					}
+					context.senses().holdContainer(level, pos, command.get("seconds").getAsFloat());
+					yield report(id, true, "");
+				}
+				case "hold_trades" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					context.senses().holdTrades(player, command.get("seconds").getAsFloat(), command.get("how").getAsString(),
+							command.has("damage") ? command.get("damage").getAsFloat() : 0);
+					yield report(id, true, "");
+				}
+				case "push_player" -> pushPlayer(level, command, id, context);
+				case "set_respawn" -> setRespawn(level, command, id, context);
+				case "put_ender_chest" -> putEnderChest(level, command, id, context, data);
+				case "firework" -> firework(level, command, id);
+				case "snowball" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					Vec3 from = grounded(level, command.getAsJsonArray("from"));
+					var ball = new net.minecraft.world.entity.projectile.throwableitemprojectile.Snowball(level, from.x, from.y, from.z,
+							new ItemStack(net.minecraft.world.item.Items.SNOWBALL));
+					Vec3 at = player.position().add(0, player.getBbHeight() * 0.6, 0).subtract(from);
+					// Thrown as a player throws, a little up for the fall.
+					ball.shoot(at.x, at.y + Math.sqrt(at.x * at.x + at.z * at.z) * 0.1, at.z, 1.4f, 0.5f);
+					level.addFreshEntity(ball);
+					yield report(id, true, "");
+				}
+				case "skip_time" -> {
+					// The overworld's clock moved on, as `/time add` does: the sky with it.
+					var clock = level.registryAccess().get(net.minecraft.world.clock.WorldClocks.OVERWORLD);
+					if (clock.isEmpty()) {
+						yield report(id, false, "no overworld clock");
+					}
+					int ticks = Math.max(0, Math.min(command.get("ticks").getAsInt(), 6000));
+					level.getServer().clockManager().addTicks(clock.get(), ticks);
+					yield report(id, true, "");
+				}
+				case "drop_held" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					ItemStack held = player.getInventory().removeFromSelected(true);
+					if (held.isEmpty()) {
+						yield report(id, false, "they hold nothing");
+					}
+					// At their feet, still, a moment before it can be picked up.
+					var dropped = new net.minecraft.world.entity.item.ItemEntity(level, player.getX(), player.getY() + 0.1, player.getZ(), held, 0, 0, 0);
+					dropped.setPickUpDelay(20);
+					level.addFreshEntity(dropped);
+					yield report(id, true, "");
+				}
+				case "map_mark" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					JsonArray at = command.getAsJsonArray("at");
+					context.mapMarks().mark(player, new Vec3(at.get(0).getAsDouble(), at.get(1).getAsDouble(), at.get(2).getAsDouble()), command.get("seconds").getAsFloat());
+					yield report(id, true, "");
+				}
+				case "drain_air" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					context.breaths().drain(player, command.get("seconds").getAsFloat());
+					yield report(id, true, "");
+				}
+				case "wear_face" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					Entity entity = level.getEntity(command.get("entity").getAsInt());
+					Mob mob = entity == null ? null : Senses.mob(entity);
+					if (player == null || mob == null) {
+						yield report(id, false, player == null ? "the player is not here" : "no mob with that id here");
+					}
+					context.masks().put(mob, player, command.get("seconds").getAsFloat());
+					yield report(id, true, "");
+				}
+				case "eye_home" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					JsonArray to = command.getAsJsonArray("to");
+					context.eyes().arm(player, new Vec3(to.get(0).getAsDouble(), to.get(1).getAsDouble(), to.get(2).getAsDouble()), command.get("seconds").getAsFloat());
+					yield report(id, true, "");
+				}
+				case "dig_in" -> digIn(level, command, id, context);
+				case "offer_trade" -> offerTrade(level, command, id, context, data);
+				case "move_player" -> movePlayer(level, command, id, context);
+				case "set_state" -> setState(level, command, id);
+				case "grow" -> grow(level, command, id);
+				case "arm_loot" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					context.loot().arm(player, mod.id(), command);
+					yield report(id, true, "");
+				}
+				case "block_sound" -> blockSound(level, command, id, context);
+				case "approach" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					// One brings them what is kept, and drops it at their feet (ABI 51).
+					if ("give".equals(command.has("then") ? command.get("then").getAsString() : "")) {
+						String kept = command.has("kept") ? command.get("kept").getAsString() : "";
+						Entity first = command.getAsJsonArray("entities").isEmpty() ? null : level.getEntity(command.getAsJsonArray("entities").get(0).getAsInt());
+						Mob bringer = first == null ? null : Senses.mob(first);
+						if (bringer == null || bringer.entityTags().contains(Holds.TAG) || bringer.entityTags().contains(Warps.TAG)) {
+							yield report(id, false, "none of them here");
+						}
+						ItemStack give = data.giveBack(kept);
+						if (give == null || give.isEmpty()) {
+							yield report(id, false, "nothing kept under that name");
+						}
+						context.approaches().addGiving(bringer, player, command.get("stop").getAsFloat(), command.get("seconds").getAsFloat(),
+								command.has("pace") && !command.get("pace").isJsonNull() ? command.get("pace").getAsFloat() : 1f, give, data, kept);
+						yield report(id, true, "bringing it");
+					}
+					// To a place instead of at them (ABI 54): the ground there when its y is below -1000.
+					if (command.has("to") && !command.get("to").isJsonNull()) {
+						Vec3 to = grounded(level, command.getAsJsonArray("to"));
+						int going = 0;
+						for (var each : command.getAsJsonArray("entities")) {
+							Entity entity = level.getEntity(each.getAsInt());
+							Mob mob = entity == null ? null : Senses.mob(entity);
+							if (mob != null && !mob.entityTags().contains(Holds.TAG) && !mob.entityTags().contains(Warps.TAG)) {
+								context.approaches().addTo(mob, player, to, command.get("seconds").getAsFloat());
+								going++;
+							}
+						}
+						yield report(id, going > 0, going > 0 ? "going " + going : "none of them here");
+					}
+					int walking = 0;
+					for (var each : command.getAsJsonArray("entities")) {
+						Entity entity = level.getEntity(each.getAsInt());
+						Mob mob = entity == null ? null : Senses.mob(entity);
+						if (mob != null && !mob.entityTags().contains(Holds.TAG) && !mob.entityTags().contains(Warps.TAG)) {
+							context.approaches().add(mob, player, command.get("stop").getAsFloat(), command.get("seconds").getAsFloat(),
+									command.has("pace") && !command.get("pace").isJsonNull() ? command.get("pace").getAsFloat() : 1f,
+									command.has("then") ? command.get("then").getAsString() : "",
+									command.has("damage") ? command.get("damage").getAsFloat() : 0f);
+							walking++;
+						}
+					}
+					yield report(id, walking > 0, walking > 0 ? "walking " + walking : "none of them here");
+				}
+				case "shoot" -> shoot(level, command, id, context);
+				case "write_book" -> writeBook(command, id, data);
+				case "add_page" -> addPage(level, command, id);
+				case "put_book" -> putBook(level, command, id, data);
+				case "other_house" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					String why = context.otherHouse().visit(level, player, blockPos(command.getAsJsonArray("center")), command.get("radius").getAsInt(),
+							blockPos(command.getAsJsonArray("bed")), blockPos(command.getAsJsonArray("door")), command.get("seconds").getAsFloat(),
+							command.has("comes") && command.get("comes").getAsBoolean(), context.figures());
+					yield report(id, why.isEmpty(), why);
+				}
+				case "confront" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					JsonArray roof = command.getAsJsonArray("roof");
+					List<String> blocks = new ArrayList<>();
+					command.getAsJsonArray("blocks").forEach(b -> blocks.add(b.getAsString()));
+					if (blocks.isEmpty()) {
+						blocks.add("minecraft:cobblestone");
+					}
+					String why = context.fights().start(level, player, blockPos(command.getAsJsonArray("at")),
+							new Vec3(roof.get(0).getAsDouble(), roof.get(1).getAsDouble(), roof.get(2).getAsDouble()), blocks, data,
+							command.has("fierce") ? command.get("fierce").getAsFloat() : 0);
+					yield report(id, why == null, why == null ? "the fight is on" : why);
+				}
+				case "splash_potion" -> splashPotion(level, command, id, context);
+				case "put_potion" -> putPotion(level, command, id);
+				case "change_potion" -> changePotion(level, command, id);
+				case "effect_cloud" -> effectCloud(level, command, id);
+				case "kill_player" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					String why = context.deaths().kill(player, data);
+					yield report(id, why == null, why == null ? "" : why);
+				}
+				case "spill_container" -> spillContainer(level, command, id);
+				case "carry_block" -> {
+					Entity entity = level.getEntity(command.get("entity").getAsInt());
+					if (!(entity instanceof net.minecraft.world.entity.monster.Enderman enderman)) {
+						yield report(id, false, "no enderman with that id here");
+					}
+					Optional<Holder.Reference<Block>> block = BuiltInRegistries.BLOCK.get(Identifier.parse(command.get("block").getAsString()));
+					if (block.isEmpty()) {
+						yield report(id, false, "no such block");
+					}
+					// Never in place of one it carries (which may be from their building).
+					if (enderman.getCarriedBlock() != null) {
+						yield report(id, false, "it carries a block already");
+					}
+					enderman.setCarriedBlock(block.get().value().defaultBlockState());
+					yield report(id, true, "");
+				}
+				case "bobber" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					context.bobbers().arm(player, command.get("seconds").getAsFloat(), command.get("under").getAsFloat());
+					yield report(id, true, "armed");
+				}
+				case "frames_show" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					Optional<Holder.Reference<net.minecraft.world.item.Item>> item = BuiltInRegistries.ITEM.get(Identifier.parse(command.get("item").getAsString()));
+					if (item.isEmpty()) {
+						yield report(id, false, "no such item");
+					}
+					List<net.minecraft.world.entity.decoration.ItemFrame> frames = new ArrayList<>();
+					for (var each : command.getAsJsonArray("frames")) {
+						if (level.getEntity(each.getAsInt()) instanceof net.minecraft.world.entity.decoration.ItemFrame frame) {
+							frames.add(frame);
+						}
+					}
+					int shown = context.frameShows().show(player, frames, new net.minecraft.world.item.ItemStack(item.get()), command.get("seconds").getAsFloat());
+					yield report(id, shown > 0, shown > 0 ? "shown in " + shown : "no frame of those here");
+				}
+				case "shove" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					context.shoves().arm(player, command.get("seconds").getAsFloat(), command.get("most_drop").getAsInt());
+					yield report(id, true, "armed");
+				}
+				case "footsteps" -> {
+					ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+					if (player == null) {
+						yield report(id, false, "the player is not here");
+					}
+					context.footsteps().add(player, command.get("seconds").getAsFloat(), command.get("behind").getAsFloat(), command.get("delay").getAsInt());
+					yield report(id, true, "");
+				}
+				default -> report(id, false, "the host does not carry out " + kind + " yet");
+			};
+		} catch (RuntimeException e) {
+			return report(id, false, kind + ": " + e.getMessage());
+		}
+	}
+
+	private static JsonObject playSound(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+
+		Optional<Holder.Reference<SoundEvent>> sound = BuiltInRegistries.SOUND_EVENT.get(Identifier.parse(command.get("sound").getAsString()));
+		if (sound.isEmpty()) {
+			return report(id, false, "no such sound");
+		}
+
+		JsonArray pos = command.getAsJsonArray("pos");
+		player.connection.send(new ClientboundSoundPacket(sound.get(), SoundSource.AMBIENT,
+				pos.get(0).getAsDouble(), pos.get(1).getAsDouble(), pos.get(2).getAsDouble(),
+				command.get("volume").getAsFloat(), command.get("pitch").getAsFloat(), level.getRandom().nextLong()));
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject blockSound(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		String which = command.get("block").getAsString();
+		BlockState state;
+		if (which.equals("under")) {
+			state = level.getBlockState(player.blockPosition().below());
+		} else if (which.equals("held")) {
+			state = player.getMainHandItem().getItem() instanceof net.minecraft.world.item.BlockItem held
+					? held.getBlock().defaultBlockState()
+					: Blocks.STONE.defaultBlockState();
+		} else {
+			Optional<Holder.Reference<Block>> block = BuiltInRegistries.BLOCK.get(Identifier.parse(which));
+			if (block.isEmpty()) {
+				return report(id, false, "no such block");
+			}
+			state = block.get().value().defaultBlockState();
+		}
+		if (state.isAir()) {
+			state = Blocks.STONE.defaultBlockState();
+		}
+		net.minecraft.world.level.block.SoundType type = state.getSoundType();
+		SoundEvent sound = switch (command.get("of").getAsString()) {
+			case "place" -> type.getPlaceSound();
+			case "break" -> type.getBreakSound();
+			case "hit" -> type.getHitSound();
+			default -> type.getStepSound();
+		};
+
+		JsonArray pos = command.getAsJsonArray("pos");
+		player.connection.send(new ClientboundSoundPacket(Holder.direct(sound), SoundSource.BLOCKS,
+				pos.get(0).getAsDouble(), pos.get(1).getAsDouble(), pos.get(2).getAsDouble(),
+				command.get("volume").getAsFloat() * type.getVolume(), command.get("pitch").getAsFloat() * type.getPitch(), level.getRandom().nextLong()));
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject hint(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+
+		Optional<BlockPos> pos = command.has("pos") && !command.get("pos").isJsonNull() ? Optional.of(blockPos(command.getAsJsonArray("pos"))) : Optional.empty();
+		context.sendHint().accept(player, new HintPayload(command.get("hint").getAsString(), pos, command.get("seconds").getAsFloat(), command.has("detail") ? command.get("detail").getAsString() : ""));
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject scan(ServerLevel level, JsonObject command, long id, Context context) {
+		BlockPos min = blockPos(command.getAsJsonArray("min"));
+		BlockPos max = blockPos(command.getAsJsonArray("max"));
+		int step = command.has("step") ? command.get("step").getAsInt() : 0;
+		boolean dark = command.has("dark") && command.get("dark").getAsBoolean();
+		int most = command.has("most") ? command.get("most").getAsInt() : 0;
+		int[] lo = {min.getX(), min.getY(), min.getZ()};
+		int[] hi = {max.getX(), max.getY(), max.getZ()};
+		long volume = ScanBox.reads(lo, hi, step);
+		if (volume > SCAN_LIMIT) {
+			return report(id, false, "the scan reads " + volume + " blocks; at most " + SCAN_LIMIT);
+		}
+
+		List<String> wanted = new ArrayList<>();
+		for (JsonElement kind : command.getAsJsonArray("kinds")) {
+			wanted.add(kind.getAsString());
+		}
+
+		java.util.Map<String, Integer> counts = new java.util.TreeMap<>();
+		JsonArray positions = new JsonArray();
+		JsonArray outs = new JsonArray();
+		BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+		for (int x : ScanBox.axis(lo[0], hi[0], step)) {
+			for (int y : ScanBox.axis(lo[1], hi[1], step)) {
+				for (int z : ScanBox.axis(lo[2], hi[2], step)) {
+					pos.set(x, y, z);
+					String block = Senses.blockId(level.getBlockState(pos));
+					counts.merge(block, 1, Integer::sum);
+					if (!Kinds.wanted(block, wanted) || (most > 0 && positions.size() >= most)) {
+						continue;
+					}
+					if (dark && (level.getBrightness(net.minecraft.world.level.LightLayer.SKY, pos) > 0
+							|| level.getBrightness(net.minecraft.world.level.LightLayer.BLOCK, pos) > 0)) {
+						continue;
+					}
+					JsonArray entry = new JsonArray();
+					entry.add(block);
+					entry.add(Senses.blockPos(pos.immutable()));
+					positions.add(entry);
+					JsonArray out = doorOut(level, pos.immutable());
+					if (out != null) {
+						outs.add(out);
+					}
+				}
+			}
+		}
+
+		JsonObject answer = new JsonObject();
+		answer.addProperty("id", id);
+		JsonArray countsArray = new JsonArray();
+		counts.forEach((block, count) -> {
+			JsonArray entry = new JsonArray();
+			entry.add(block);
+			entry.add(count);
+			countsArray.add(entry);
+		});
+		answer.add("counts", countsArray);
+		answer.add("positions", positions);
+		answer.add("outs", outs);
+		context.senses().scanned(level, answer);
+
+		return report(id, true, "");
+	}
+
+	/**
+	 * A door's lower half: its position and the way out, {@code [pos, [dx, dz]]}, the side along
+	 * its facing with sky over it ({@link DoorOut}); null for anything else, or a door that does
+	 * not tell.
+	 */
+	private static JsonArray doorOut(ServerLevel level, BlockPos pos) {
+		BlockState state = level.getBlockState(pos);
+		if (!state.is(net.minecraft.tags.BlockTags.DOORS)
+				|| state.getValue(net.minecraft.world.level.block.DoorBlock.HALF) != net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER) {
+			return null;
+		}
+		Direction facing = state.getValue(net.minecraft.world.level.block.DoorBlock.FACING);
+		int side = DoorOut.side(skyBeside(level, pos, facing), skyBeside(level, pos, facing.getOpposite()));
+		if (side == 0) {
+			return null;
+		}
+		Direction out = side > 0 ? facing : facing.getOpposite();
+		JsonArray way = new JsonArray();
+		way.add(out.getStepX());
+		way.add(out.getStepZ());
+		JsonArray entry = new JsonArray();
+		entry.add(Senses.blockPos(pos));
+		entry.add(way);
+		return entry;
+	}
+
+	/** Whether the sky is over a head's height on this side of a door, within {@link DoorOut#LOOK} blocks. */
+	private static boolean skyBeside(ServerLevel level, BlockPos door, Direction side) {
+		for (int n = 1; n <= DoorOut.LOOK; n++) {
+			if (level.canSeeSky(door.relative(side, n).above())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static JsonObject toggleBlock(ServerLevel level, BlockPos pos, long id) {
+		return toggleBlock(level, pos, id, null);
+	}
+
+	/**
+	 * A block toggled, or with {@code to} set to open or lit ({@code true}) or shut or out ({@code
+	 * false}), left alone when it is so already (ABI 50: "close the door" opened a door left shut).
+	 */
+	private static JsonObject toggleBlock(ServerLevel level, BlockPos pos, long id, Boolean to) {
+		BlockState state = level.getBlockState(pos);
+		Block block = state.getBlock();
+
+		if (block instanceof DoorBlock door) {
+			boolean open = to == null ? !door.isOpen(state) : to;
+			if (open == door.isOpen(state)) {
+				return report(id, true, "it is so already");
+			}
+			door.setOpen(null, level, state, pos, open);
+			return report(id, true, "");
+		}
+		if (to != null && state.hasProperty(BlockStateProperties.OPEN) && state.getValue(BlockStateProperties.OPEN) == to) {
+			return report(id, true, "it is so already");
+		}
+		if (to != null && state.hasProperty(BlockStateProperties.LIT) && state.getValue(BlockStateProperties.LIT) == to) {
+			return report(id, true, "it is so already");
+		}
+
+		if (block instanceof LeverBlock lever) {
+			// Never a lever with TNT within 16 blocks: whatever it is wired to, nothing of theirs
+			// goes up (the docs promised this check, and there was none).
+			for (BlockPos near : BlockPos.betweenClosed(pos.offset(-16, -16, -16), pos.offset(16, 16, 16))) {
+				if (level.isLoaded(near) && level.getBlockState(near).is(net.minecraft.world.level.block.Blocks.TNT)) {
+					return report(id, false, "TNT within 16 blocks");
+				}
+			}
+			lever.pull(state, level, pos, null);
+			return report(id, true, "");
+		}
+
+		// A cauldron full that was empty, or empty that was full.
+		if (block == net.minecraft.world.level.block.Blocks.CAULDRON) {
+			level.setBlock(pos, net.minecraft.world.level.block.Blocks.WATER_CAULDRON.defaultBlockState()
+					.setValue(net.minecraft.world.level.block.LayeredCauldronBlock.LEVEL, 3), Block.UPDATE_ALL);
+			return report(id, true, "");
+		}
+		if (block == net.minecraft.world.level.block.Blocks.WATER_CAULDRON) {
+			level.setBlock(pos, net.minecraft.world.level.block.Blocks.CAULDRON.defaultBlockState(), Block.UPDATE_ALL);
+			return report(id, true, "");
+		}
+
+		// A bell rings, swinging, as if struck (batch 9).
+		if (block instanceof net.minecraft.world.level.block.BellBlock bell) {
+			boolean rang = bell.attemptToRing(level, pos, state.getValue(net.minecraft.world.level.block.BellBlock.FACING));
+			return report(id, rang, rang ? "" : "the bell would not ring");
+		}
+
+		if (state.hasProperty(BlockStateProperties.OPEN)) {
+			level.setBlock(pos, state.cycle(BlockStateProperties.OPEN), Block.UPDATE_ALL);
+			return report(id, true, "");
+		}
+
+		// Campfires and candles: lit or not. Never a furnace, whose LIT the game owns.
+		if (state.hasProperty(BlockStateProperties.LIT) && (Senses.blockId(state).contains("campfire") || Senses.blockId(state).contains("candle") || Senses.blockId(state).contains("redstone_lamp"))) {
+			level.setBlock(pos, state.cycle(BlockStateProperties.LIT), Block.UPDATE_ALL);
+			return report(id, true, "");
+		}
+
+		return report(id, false, Senses.blockId(state) + " has nothing to toggle");
+	}
+
+	/** The block ids a {@code set_block} may replace, beyond air; empty for air alone. */
+	private static List<String> replaceable(JsonObject command) {
+		return replaceable(command, "replace");
+	}
+
+	/** The block ids a command lists under a key. */
+	private static List<String> replaceable(JsonObject command, String key) {
+		List<String> ids = new ArrayList<>();
+		if (command.has(key) && command.get(key).isJsonArray()) {
+			for (JsonElement id : command.getAsJsonArray(key)) {
+				ids.add(id.getAsString());
+			}
+		}
+
+		return ids;
+	}
+
+	private static JsonObject openLid(ServerLevel level, BlockPos pos, float seconds, long id, Context context) {
+		BlockState state = level.getBlockState(pos);
+		if (!(level.getBlockEntity(pos) instanceof net.minecraft.world.level.block.entity.ChestBlockEntity)) {
+			return report(id, false, "no chest there");
+		}
+
+		// Block event 1 is the chest's opener count: the clients animate the lid from it.
+		level.blockEvent(pos, state.getBlock(), 1, 1);
+		level.playSound(null, pos, net.minecraft.sounds.SoundEvents.CHEST_OPEN, SoundSource.BLOCKS, 0.5f, level.getRandom().nextFloat() * 0.1f + 0.9f);
+		context.later().at(seconds, () -> {
+			if (level.getBlockEntity(pos) instanceof net.minecraft.world.level.block.entity.ChestBlockEntity) {
+				level.blockEvent(pos, level.getBlockState(pos).getBlock(), 1, 0);
+				level.playSound(null, pos, net.minecraft.sounds.SoundEvents.CHEST_CLOSE, SoundSource.BLOCKS, 0.5f, level.getRandom().nextFloat() * 0.1f + 0.9f);
+			}
+		});
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject rotateFrame(ServerLevel level, JsonObject command, long id) {
+		if (!(level.getEntity(command.get("entity").getAsInt()) instanceof net.minecraft.world.entity.decoration.ItemFrame frame)) {
+			return report(id, false, "no item frame with that id here");
+		}
+		if (frame.getItem().isEmpty()) {
+			return report(id, false, "the frame is empty");
+		}
+
+		int rotation = command.has("rotation") && !command.get("rotation").isJsonNull()
+				? command.get("rotation").getAsInt() % 8
+				: (frame.getRotation() + 1) % 8;
+		frame.setRotation(rotation);
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject swapPainting(ServerLevel level, int entityId, long id) {
+		if (!(level.getEntity(entityId) instanceof net.minecraft.world.entity.decoration.painting.Painting painting)) {
+			return report(id, false, "no painting with that id here");
+		}
+
+		Holder<net.minecraft.world.entity.decoration.painting.PaintingVariant> current = painting.getVariant();
+		net.minecraft.core.Registry<net.minecraft.world.entity.decoration.painting.PaintingVariant> registry = level.registryAccess().lookupOrThrow(net.minecraft.core.registries.Registries.PAINTING_VARIANT);
+		List<Holder.Reference<net.minecraft.world.entity.decoration.painting.PaintingVariant>> same = registry.listElements()
+				.filter(variant -> variant.value().width() == current.value().width() && variant.value().height() == current.value().height() && !variant.equals(current))
+				.toList();
+		if (same.isEmpty()) {
+			return report(id, false, "no other painting of that size");
+		}
+
+		// A new painting in the old one's place: the variant is final on the entity.
+		Holder<net.minecraft.world.entity.decoration.painting.PaintingVariant> chosen = same.get(level.getRandom().nextInt(same.size()));
+		net.minecraft.world.entity.decoration.painting.Painting replacement = new net.minecraft.world.entity.decoration.painting.Painting(level, painting.getPos(), painting.getDirection(), chosen);
+		painting.discard();
+		level.addFreshEntity(replacement);
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject poseStand(ServerLevel level, JsonObject command, long id, Context context) {
+		if (!(level.getEntity(command.get("entity").getAsInt()) instanceof net.minecraft.world.entity.decoration.ArmorStand stand)) {
+			return report(id, false, "no armour stand with that id here");
+		}
+
+		if (command.has("follow") && !command.get("follow").isJsonNull()) {
+			ServerPlayer player = context.senses().player(level, command.get("follow").getAsInt());
+			if (player == null) {
+				return report(id, false, "the player is not here");
+			}
+			context.poses().add(stand, player, command.get("seconds").getAsFloat());
+
+			return report(id, true, "");
+		}
+
+		if (command.has("at") && !command.get("at").isJsonNull()) {
+			JsonArray at = command.getAsJsonArray("at");
+			stand.setHeadPose(Poses.headToward(stand, new Vec3(at.get(0).getAsDouble(), at.get(1).getAsDouble(), at.get(2).getAsDouble())));
+
+			return report(id, true, "");
+		}
+
+		return report(id, false, "neither a place to face nor a player to follow");
+	}
+
+	private static JsonObject nameEntity(ServerLevel level, int entityId, String name, long id) {
+		Entity entity = level.getEntity(entityId);
+		if (entity == null) {
+			return report(id, false, "no entity with that id here");
+		}
+
+		entity.setCustomName(Component.literal(name));
+		entity.setCustomNameVisible(true);
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject dyeSheep(ServerLevel level, int entityId, String colour, long id) {
+		if (!(level.getEntity(entityId) instanceof net.minecraft.world.entity.animal.sheep.Sheep sheep)) {
+			return report(id, false, "no sheep with that id here");
+		}
+
+		net.minecraft.world.item.DyeColor dye = net.minecraft.world.item.DyeColor.byName(colour, null);
+		if (dye == null) {
+			return report(id, false, "no colour called " + colour);
+		}
+
+		sheep.setColor(dye);
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject moveEntity(ServerLevel level, JsonObject command, long id, Context context) {
+		int entityId = command.get("entity").getAsInt();
+		JsonArray to = command.getAsJsonArray("to");
+		double x = to.get(0).getAsDouble();
+		double y = to.get(1).getAsDouble();
+		double z = to.get(2).getAsDouble();
+
+		// A player index wrapped from the top names the player; a player moves two blocks at most
+		// (waking a block from the bed), never farther.
+		if (entityId > Integer.MAX_VALUE - 64) {
+			ServerPlayer player = context.senses().player(level, Integer.MAX_VALUE - entityId);
+			if (player == null) {
+				return report(id, false, "the player is not here");
+			}
+			if (player.position().distanceTo(new Vec3(x, y, z)) > 2.5) {
+				return report(id, false, "a player is moved two blocks at most");
+			}
+			player.teleportTo(x, y, z);
+			return report(id, true, "");
+		}
+
+		Entity entity = level.getEntity(entityId);
+		if (entity == null || entity instanceof ServerPlayer) {
+			return report(id, false, "no movable entity with that id here");
+		}
+		// Never into a wall: the first spot with room for it within two blocks, up first, or not
+		// at all (a pet set into a wall suffocated).
+		Vec3 free = roomFor(level, entity, new Vec3(x, y, z));
+		if (free == null) {
+			return report(id, false, "no room for it there");
+		}
+		entity.teleportTo(free.x, free.y, free.z);
+
+		return report(id, true, "");
+	}
+
+	/** Where {@code entity} fits at or near {@code at}: up to two blocks up, then a block aside. */
+	private static Vec3 roomFor(ServerLevel level, Entity entity, Vec3 at) {
+		double[][] tries = {{0, 0, 0}, {0, 1, 0}, {0, 2, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {1, 1, 0}, {-1, 1, 0}, {0, 1, 1}, {0, 1, -1}};
+		for (double[] t : tries) {
+			Vec3 to = at.add(t[0], t[1], t[2]);
+			if (!level.isLoaded(BlockPos.containing(to))) {
+				continue;
+			}
+			net.minecraft.world.phys.AABB box = entity.getBoundingBox().move(to.subtract(entity.position()));
+			if (level.noCollision(entity, box) && !level.containsAnyLiquid(box)) {
+				return to;
+			}
+		}
+		return null;
+	}
+
+	/** The mounts a figure may be set on (ABI 55). */
+	private static final List<String> MOUNTS = List.of("minecraft:skeleton_horse", "minecraft:zombie_horse", "minecraft:horse");
+
+	/**
+	 * Where a figure stands in lava: the surface of the nearest still lava with air over it, six
+	 * to sixteen blocks from them, eight up or down; null for none.
+	 */
+	private static Vec3 lavaNear(ServerLevel level, ServerPlayer player) {
+		BlockPos at = player.blockPosition();
+		BlockPos best = null;
+		double bestDistance = Double.MAX_VALUE;
+		for (BlockPos pos : BlockPos.betweenClosed(at.offset(-16, -8, -16), at.offset(16, 8, 16))) {
+			double d = pos.distSqr(at);
+			if (d < 36 || d > 256 || d >= bestDistance || !level.isLoaded(pos)) {
+				continue;
+			}
+			var fluid = level.getFluidState(pos);
+			if (fluid.is(net.minecraft.tags.FluidTags.LAVA) && fluid.isSource() && level.getBlockState(pos.above()).isAir()) {
+				best = pos.immutable();
+				bestDistance = d;
+			}
+		}
+
+		return best == null ? null : new Vec3(best.getX() + 0.5, best.getY() + 0.5, best.getZ() + 0.5);
+	}
+
+	/**
+	 * Where a head peeks over a cliff at them: straight ahead within fourteen blocks (three to a
+	 * side), the first column whose ground stands eight or more over them with the one before it
+	 * lower, a face of rock between; its top, for a `sunk` figure. Null for none.
+	 */
+	private static Vec3 cliffTopAhead(ServerLevel level, ServerPlayer player) {
+		Vec3 look = player.getViewVector(1f);
+		Vec3 ahead = new Vec3(look.x, 0, look.z).normalize();
+		Vec3 side = new Vec3(-ahead.z, 0, ahead.x);
+		double feet = player.getY();
+		for (int d = 3; d <= 14; d++) {
+			for (int s = 0; s <= 6; s++) {
+				int across = (s % 2 == 0 ? 1 : -1) * ((s + 1) / 2);
+				Vec3 p = player.position().add(ahead.scale(d)).add(side.scale(across));
+				Vec3 before = player.position().add(ahead.scale(d - 1)).add(side.scale(across));
+				BlockPos column = BlockPos.containing(p.x, 0, p.z);
+				if (!level.isLoaded(column)) {
+					continue;
+				}
+				int top = level.getHeightmapPos(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, column).getY();
+				int under = level.getHeightmapPos(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, BlockPos.containing(before.x, 0, before.z)).getY();
+				if (top >= feet + 8 && under <= top - 3) {
+					return new Vec3(column.getX() + 0.5, top, column.getZ() + 0.5);
+				}
+			}
+		}
+
+		return null;
+	}
+
+	private static JsonObject figure(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer skinOf = context.senses().player(level, command.get("skin_of").getAsInt());
+		if (skinOf == null) {
+			return report(id, false, "the player is not here");
+		}
+
+		JsonArray pos = command.getAsJsonArray("pos");
+		List<Vec3> path = new ArrayList<>();
+		if (command.has("path")) {
+			for (JsonElement point : command.getAsJsonArray("path")) {
+				JsonArray p = point.getAsJsonArray();
+				path.add(new Vec3(p.get(0).getAsDouble(), p.get(1).getAsDouble(), p.get(2).getAsDouble()));
+			}
+		}
+		ItemStack held = ItemStack.EMPTY;
+		if (command.has("held")) {
+			JsonObject item = command.getAsJsonObject("held");
+			String itemId = item.has("id") ? item.get("id").getAsString() : "";
+			if (!itemId.isEmpty()) {
+				Optional<Holder.Reference<Item>> kind = BuiltInRegistries.ITEM.get(Identifier.parse(itemId));
+				if (kind.isPresent()) {
+					held = new ItemStack(kind.get().value(), 1);
+				}
+			}
+		}
+
+		// Where it stands, found here near them (ABI 55): the mind knows no lava or cliffs.
+		Vec3 standing = new Vec3(pos.get(0).getAsDouble(), pos.get(1).getAsDouble(), pos.get(2).getAsDouble());
+		String finds = command.has("finds") ? command.get("finds").getAsString() : "";
+		if (!finds.isEmpty()) {
+			Vec3 found = switch (finds) {
+				case "lava" -> lavaNear(level, skinOf);
+				case "cliff_top" -> cliffTopAhead(level, skinOf);
+				default -> null;
+			};
+			if (found == null) {
+				return report(id, false, "nowhere for it: no " + finds.replace('_', ' ') + " near");
+			}
+			standing = found;
+		}
+
+		// The figure is shown to the player whose skin it wears: it is for them alone.
+		context.figures().show(level, skinOf, command.get("figure").getAsInt(), skinOf,
+				standing,
+				path, held, command.has("name_shown") && command.get("name_shown").getAsBoolean(),
+				command.has("seconds") ? command.get("seconds").getAsFloat() : 0,
+				command.has("vanish_within") ? command.get("vanish_within").getAsFloat() : 0,
+				command.has("mirror") && command.get("mirror").getAsBoolean(),
+				command.has("once_seen") && command.get("once_seen").getAsBoolean(),
+				command.has("copy_crouch") && command.get("copy_crouch").getAsBoolean(),
+				command.has("swinging") && command.get("swinging").getAsBoolean(),
+				command.has("upside_down") && command.get("upside_down").getAsBoolean(),
+				command.has("crawls") && command.get("crawls").getAsBoolean());
+		if (command.has("faces") && !command.get("faces").isJsonNull()) {
+			JsonArray faces = command.getAsJsonArray("faces");
+			context.figures().face(skinOf, command.get("figure").getAsInt(), new Vec3(faces.get(0).getAsDouble(), faces.get(1).getAsDouble(), faces.get(2).getAsDouble()));
+		}
+		if (command.has("then_at") && command.get("then_at").isJsonArray() && !command.getAsJsonArray("then_at").isEmpty()) {
+			List<Vec3> spots = new ArrayList<>();
+			for (JsonElement spot : command.getAsJsonArray("then_at")) {
+				JsonArray p = spot.getAsJsonArray();
+				spots.add(new Vec3(p.get(0).getAsDouble(), p.get(1).getAsDouble(), p.get(2).getAsDouble()));
+			}
+			context.figures().thenAt(skinOf, command.get("figure").getAsInt(), spots);
+		}
+		if (command.has("drawn_to_light") && command.get("drawn_to_light").getAsBoolean()) {
+			context.figures().drawnToLight(skinOf, command.get("figure").getAsInt());
+		}
+		if (command.has("while_unseen") && !command.get("while_unseen").isJsonNull()) {
+			context.figures().whileUnseen(skinOf, command.get("figure").getAsInt(), command.get("while_unseen").getAsFloat());
+		}
+		if (command.has("peeks") && !command.get("peeks").isJsonNull()) {
+			JsonArray behind = command.getAsJsonArray("peeks");
+			context.figures().peek(skinOf, command.get("figure").getAsInt(), new Vec3(behind.get(0).getAsDouble(), behind.get(1).getAsDouble(), behind.get(2).getAsDouble()));
+		}
+		if (command.has("on_leaves") && command.get("on_leaves").getAsBoolean()) {
+			context.figures().onLeaves(skinOf, command.get("figure").getAsInt());
+		}
+		if (command.has("eats") && command.get("eats").getAsBoolean()) {
+			context.figures().eat(skinOf, command.get("figure").getAsInt());
+		}
+		if (command.has("jumps") && command.get("jumps").getAsBoolean()) {
+			context.figures().jump(skinOf, command.get("figure").getAsInt());
+		}
+		if (command.has("sunk") && command.get("sunk").getAsBoolean()) {
+			context.figures().sink(skinOf, command.get("figure").getAsInt());
+		}
+		if (command.has("walks") && command.get("walks").getAsBoolean()) {
+			context.figures().walk(skinOf, command.get("figure").getAsInt());
+		}
+		if (command.has("falls") && command.get("falls").getAsBoolean()) {
+			context.figures().fall(skinOf, command.get("figure").getAsInt());
+		}
+		if (command.has("lies") && command.get("lies").getAsBoolean()) {
+			context.figures().lie(skinOf, command.get("figure").getAsInt());
+		}
+		if (command.has("together") && command.get("together").getAsInt() != 0) {
+			context.figures().together(skinOf, command.get("figure").getAsInt(), command.get("together").getAsInt());
+		}
+		if (command.has("rushes") && command.get("rushes").getAsBoolean()) {
+			context.figures().rushAt(skinOf, command.get("figure").getAsInt());
+		}
+		if (command.has("rides") && command.get("rides").getAsInt() != 0
+				&& !context.figures().ride(skinOf, command.get("figure").getAsInt(), command.get("rides").getAsInt())) {
+			context.figures().remove(skinOf, command.get("figure").getAsInt());
+			return report(id, false, "nothing to ride with that id, or someone rides it");
+		}
+		if (command.has("mount") && !command.get("mount").getAsString().isEmpty()) {
+			String mount = command.get("mount").getAsString();
+			if (!MOUNTS.contains(mount)) {
+				context.figures().remove(skinOf, command.get("figure").getAsInt());
+				return report(id, false, "not a mount it places");
+			}
+			Optional<Holder.Reference<net.minecraft.world.entity.EntityType<?>>> kind = BuiltInRegistries.ENTITY_TYPE.get(Identifier.parse(mount));
+			Entity horse = kind.map(k -> k.value().create(level, net.minecraft.world.entity.EntitySpawnReason.MOB_SUMMONED)).orElse(null);
+			Vec3 under = context.figures().where(skinOf, command.get("figure").getAsInt());
+			if (horse == null || under == null) {
+				context.figures().remove(skinOf, command.get("figure").getAsInt());
+				return report(id, false, "the mount could not be made");
+			}
+			horse.snapTo(under.x, under.y, under.z, skinOf.getYRot() + 180, 0);
+			if (horse instanceof net.minecraft.world.entity.Mob mob) {
+				mob.setNoAi(true);
+			}
+			horse.setSilent(true);
+			horse.setPermanentlyInvulnerable(true);
+			level.addFreshEntity(horse);
+			float lasts = command.has("seconds") && command.get("seconds").getAsFloat() > 0 ? command.get("seconds").getAsFloat() : 60;
+			context.temporaries().add(horse, lasts);
+			if (!context.figures().ride(skinOf, command.get("figure").getAsInt(), horse.getId())) {
+				horse.discard();
+				context.figures().remove(skinOf, command.get("figure").getAsInt());
+				return report(id, false, "it could not sit the mount");
+			}
+		}
+		if (command.has("rides_behind") && command.get("rides_behind").getAsBoolean()
+				&& !context.figures().seatBehind(skinOf, command.get("figure").getAsInt())) {
+			context.figures().remove(skinOf, command.get("figure").getAsInt());
+			return report(id, false, "the player rides no boat with a seat to spare");
+		}
+
+		return report(id, true, "");
+	}
+
+	/** Another block in a block's place, every property they share kept: a wall torch's facing, a lantern's hanging (ABI 24). */
+	private static JsonObject swapBlock(ServerLevel level, JsonObject command, long id) {
+		BlockPos pos = blockPos(command.getAsJsonArray("pos"));
+		BlockState there = level.getBlockState(pos);
+		if (!replaceable(command, "only").contains(Senses.blockId(there))) {
+			return report(id, false, "the place holds " + Senses.blockId(there));
+		}
+		Optional<Holder.Reference<Block>> block = BuiltInRegistries.BLOCK.get(Identifier.parse(blockId(command)));
+		if (block.isEmpty()) {
+			return report(id, false, "no such block");
+		}
+		// A bed is two blocks: both halves go at once, or the other breaks.
+		if (there.getBlock() instanceof net.minecraft.world.level.block.BedBlock) {
+			return done(id, Beds.recolour(level, pos, block.get().value()));
+		}
+		BlockState swapped = block.get().value().defaultBlockState();
+		for (net.minecraft.world.level.block.state.properties.Property<?> property : there.getProperties()) {
+			swapped = copy(there, swapped, property);
+		}
+		level.setBlock(pos, swapped, Block.UPDATE_ALL);
+
+		return report(id, true, "");
+	}
+
+	private static <T extends Comparable<T>> BlockState copy(BlockState from, BlockState to, net.minecraft.world.level.block.state.properties.Property<T> property) {
+		return to.hasProperty(property) ? to.setValue(property, from.getValue(property)) : to;
+	}
+
+	private static JsonObject bedBeside(ServerLevel level, JsonObject command, long id) {
+		Optional<Holder.Reference<Block>> block = BuiltInRegistries.BLOCK.get(Identifier.parse(blockId(command)));
+		if (block.isEmpty()) {
+			return report(id, false, "no such block");
+		}
+
+		return done(id, Beds.beside(level, blockPos(command.getAsJsonArray("pos")), block.get().value()));
+	}
+
+	/** Footprints in the snow from one block to another: a layer off at each step, left and right of the line (ABI 30). */
+	private static JsonObject prints(ServerLevel level, JsonObject command, long id) {
+		BlockPos from = blockPos(command.getAsJsonArray("from"));
+		BlockPos to = blockPos(command.getAsJsonArray("to"));
+		double dx = to.getX() - from.getX();
+		double dz = to.getZ() - from.getZ();
+		double length = Math.sqrt(dx * dx + dz * dz);
+		if (length < 2) {
+			return report(id, false, "too short a way");
+		}
+		double ux = dx / length;
+		double uz = dz / length;
+		int made = 0;
+		for (int i = 1; i <= Math.min(40, (int) length); i++) {
+			// Left foot, right foot: half a block either side of the line.
+			double side = (i % 2 == 0 ? 0.45 : -0.45);
+			int x = (int) Math.floor(from.getX() + 0.5 + ux * i - uz * side);
+			int z = (int) Math.floor(from.getZ() + 0.5 + uz * i + ux * side);
+			for (int y = from.getY() + 3; y >= from.getY() - 4; y--) {
+				BlockPos at = new BlockPos(x, y, z);
+				BlockState state = level.getBlockState(at);
+				if (state.is(net.minecraft.world.level.block.Blocks.SNOW)) {
+					int layers = state.getValue(net.minecraft.world.level.block.SnowLayerBlock.LAYERS);
+					level.setBlock(at, layers > 1
+							? state.setValue(net.minecraft.world.level.block.SnowLayerBlock.LAYERS, layers - 1)
+							: net.minecraft.world.level.block.Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL);
+					made++;
+					break;
+				}
+				if (!state.isAir()) {
+					break;
+				}
+			}
+		}
+
+		return made >= 3 ? report(id, true, "") : report(id, false, "no snow along the way");
+	}
+
+	/** An empty jukebox plays their disc from a chest; one playing stops, its disc back (ABI 29). */
+	private static JsonObject jukebox(ServerLevel level, JsonObject command, long id) {
+		if (!(level.getBlockEntity(blockPos(command.getAsJsonArray("pos"))) instanceof net.minecraft.world.level.block.entity.JukeboxBlockEntity jukebox)) {
+			return report(id, false, "no jukebox there");
+		}
+		Container from = container(level, blockPos(command.getAsJsonArray("from")));
+		if (from == null) {
+			return report(id, false, "no container to take from or give back to");
+		}
+		if (!jukebox.getTheItem().isEmpty()) {
+			ItemStack disc = jukebox.getTheItem().copy();
+			for (int slot = 0; slot < from.getContainerSize(); slot++) {
+				if (from.getItem(slot).isEmpty() && from.canPlaceItem(slot, disc)) {
+					jukebox.setTheItem(ItemStack.EMPTY);
+					from.setItem(slot, disc);
+					return report(id, true, "stopped");
+				}
+			}
+			jukebox.popOutTheItem();
+			return report(id, true, "stopped");
+		}
+		int slot = command.get("slot").getAsInt();
+		if (slot < 0 || slot >= from.getContainerSize() || !from.getItem(slot).has(net.minecraft.core.component.DataComponents.JUKEBOX_PLAYABLE)) {
+			return report(id, false, "no disc in that slot");
+		}
+		jukebox.setTheItem(from.removeItem(slot, 1));
+
+		return report(id, true, "");
+	}
+
+	/** The book on a lectern open to another page (ABI 29). */
+	private static JsonObject turnPage(ServerLevel level, JsonObject command, long id) {
+		if (!(level.getBlockEntity(blockPos(command.getAsJsonArray("pos"))) instanceof net.minecraft.world.level.block.entity.LecternBlockEntity lectern) || !lectern.hasBook()) {
+			return report(id, false, "no book on a lectern there");
+		}
+		try {
+			var count = net.minecraft.world.level.block.entity.LecternBlockEntity.class.getDeclaredMethod("getPageCount", ItemStack.class);
+			count.setAccessible(true);
+			int pages = (int) count.invoke(null, lectern.getBook());
+			if (pages < 2) {
+				return report(id, false, "the book has one page");
+			}
+			int to = (lectern.getPage() + 1 + level.getRandom().nextInt(pages - 1)) % pages;
+			var set = net.minecraft.world.level.block.entity.LecternBlockEntity.class.getDeclaredMethod("setPage", int.class);
+			set.setAccessible(true);
+			set.invoke(lectern, to);
+		} catch (ReflectiveOperationException e) {
+			return report(id, false, "the page would not turn: " + e.getMessage());
+		}
+
+		return report(id, true, "");
+	}
+
+	/** An ingredient into a brewing stand that holds potions, a blaze powder when it has no fuel: the game brews (ABI 29). */
+	private static JsonObject brew(ServerLevel level, JsonObject command, long id) {
+		if (!(level.getBlockEntity(blockPos(command.getAsJsonArray("stand"))) instanceof net.minecraft.world.level.block.entity.BrewingStandBlockEntity stand)) {
+			return report(id, false, "no brewing stand there");
+		}
+		boolean potions = !stand.getItem(0).isEmpty() || !stand.getItem(1).isEmpty() || !stand.getItem(2).isEmpty();
+		if (!potions || !stand.getItem(3).isEmpty()) {
+			return report(id, false, potions ? "the stand is brewing already" : "no potions in the stand");
+		}
+		Container from = container(level, blockPos(command.getAsJsonArray("from")));
+		int slot = command.get("slot").getAsInt();
+		if (from == null || slot < 0 || slot >= from.getContainerSize() || from.getItem(slot).isEmpty()) {
+			return report(id, false, "no ingredient in that slot");
+		}
+		stand.setItem(3, from.removeItem(slot, 1));
+		if (stand.getItem(4).isEmpty()) {
+			for (int i = 0; i < from.getContainerSize(); i++) {
+				if (from.getItem(i).is(net.minecraft.world.item.Items.BLAZE_POWDER)) {
+					stand.setItem(4, from.removeItem(i, 1));
+					break;
+				}
+			}
+		}
+		stand.setChanged();
+
+		return report(id, true, "");
+	}
+
+	/** One enchantment, never a curse, gone from an enchanted item in a container, as a grindstone would (ABI 29). */
+	private static JsonObject strip(ServerLevel level, JsonObject command, long id) {
+		Container from = container(level, blockPos(command.getAsJsonArray("from")));
+		if (from == null) {
+			return report(id, false, "no container there");
+		}
+		for (int slot = 0; slot < from.getContainerSize(); slot++) {
+			ItemStack stack = from.getItem(slot);
+			var enchantments = stack.getOrDefault(net.minecraft.core.component.DataComponents.ENCHANTMENTS, net.minecraft.world.item.enchantment.ItemEnchantments.EMPTY);
+			var removable = enchantments.keySet().stream().filter(h -> !h.is(net.minecraft.tags.EnchantmentTags.CURSE)).toList();
+			if (removable.isEmpty()) {
+				continue;
+			}
+			var chosen = removable.get(level.getRandom().nextInt(removable.size()));
+			net.minecraft.world.item.enchantment.EnchantmentHelper.updateEnchantments(stack, m -> m.removeIf(h -> h.equals(chosen)));
+			from.setChanged();
+			return report(id, true, "");
+		}
+
+		return report(id, false, "nothing enchanted there");
+	}
+
+	/** A report from a why-not: done when it is empty. */
+	private static JsonObject done(long id, String whyNot) {
+		return report(id, whyNot.isEmpty(), whyNot);
+	}
+
+	/** A block taken away for a while and put back as it was (ABI 24); only one of {@code only}, never one with contents. */
+	private static JsonObject hideBlock(ServerLevel level, JsonObject command, long id, Context context) {
+		BlockPos pos = blockPos(command.getAsJsonArray("pos"));
+		BlockState there = level.getBlockState(pos);
+		if (there.isAir() || !replaceable(command, "only").contains(Senses.blockId(there))) {
+			return report(id, false, "the place holds " + Senses.blockId(there));
+		}
+		if (level.getBlockEntity(pos) != null) {
+			return report(id, false, "a block with contents is never hidden");
+		}
+		context.hidden().hide(level, pos, command.get("seconds").getAsFloat());
+
+		return report(id, true, "");
+	}
+
+	/** What a {@code break_block} may break: things that drop as themselves and that a player rebuilds in a moment. */
+	private static boolean breakable(BlockState state) {
+		String id = Senses.blockId(state);
+		return state.is(net.minecraft.tags.BlockTags.BEDS) || id.endsWith("torch") || id.endsWith("_carpet") || id.endsWith("glass_pane")
+				|| state.is(net.minecraft.tags.BlockTags.FLOWERS) || state.is(net.minecraft.tags.BlockTags.ALL_SIGNS) || id.endsWith("lantern");
+	}
+
+	private static JsonObject breakBlock(ServerLevel level, BlockPos pos, long id) {
+		BlockState state = level.getBlockState(pos);
+		if (state.isAir()) {
+			return report(id, false, "nothing there");
+		}
+		if (!breakable(state)) {
+			return report(id, false, Senses.blockId(state) + " is not something it breaks");
+		}
+
+		// As a player's hand would: the block's own drop, both halves of a bed.
+		level.destroyBlock(pos, true);
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject rotateBlock(ServerLevel level, BlockPos pos, long id) {
+		BlockState state = level.getBlockState(pos);
+		if (state.isAir()) {
+			return report(id, false, "nothing there");
+		}
+
+		BlockState turned = state.rotate(net.minecraft.world.level.block.Rotation.CLOCKWISE_90);
+		if (turned.equals(state)) {
+			return report(id, false, Senses.blockId(state) + " does not turn");
+		}
+
+		level.setBlock(pos, turned, Block.UPDATE_ALL);
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject setFrameItem(ServerLevel level, JsonObject command, long id) {
+		if (!(level.getEntity(command.get("entity").getAsInt()) instanceof net.minecraft.world.entity.decoration.ItemFrame frame)) {
+			return report(id, false, "no item frame with that id here");
+		}
+
+		// The very stack from a container's slot, only into an empty frame (ABI 28), or traded
+		// for the frame's own with `swap` (ABI 40).
+		if (command.has("from") && command.get("from").isJsonArray()) {
+			boolean swap = command.has("swap") && command.get("swap").getAsBoolean();
+			if (!frame.getItem().isEmpty() && !swap) {
+				return report(id, false, "the frame holds something");
+			}
+			Container from = container(level, blockPos(command.getAsJsonArray("from")));
+			int slot = command.has("slot") ? command.get("slot").getAsInt() : 0;
+			if (from == null || slot < 0 || slot >= from.getContainerSize() || from.getItem(slot).isEmpty()) {
+				return report(id, false, "nothing in that slot");
+			}
+			ItemStack had = frame.getItem().copy();
+			ItemStack one = from.getItem(slot).getCount() == 1 || had.isEmpty() ? from.removeItem(slot, 1) : null;
+			if (one == null) {
+				return report(id, false, "a stack of more than one, and the frame's has nowhere to go");
+			}
+			frame.setItem(one);
+			if (!had.isEmpty()) {
+				from.setItem(slot, had);
+			}
+			from.setChanged();
+			return report(id, true, "");
+		}
+
+		JsonObject item = command.getAsJsonObject("item");
+		String itemId = item.has("id") ? item.get("id").getAsString() : "";
+		Optional<Holder.Reference<Item>> kind = itemId.isEmpty() ? Optional.empty() : BuiltInRegistries.ITEM.get(Identifier.parse(itemId));
+		if (!itemId.isEmpty() && kind.isEmpty()) {
+			return report(id, false, "no such item");
+		}
+		// What the frame held is never lost: it lands where asked, or at the frame (ABI 40;
+		// until then it was deleted).
+		ItemStack had = frame.getItem().copy();
+		frame.setItem(kind.map(k -> new ItemStack(k.value(), Math.max(1, item.get("count").getAsInt()))).orElse(ItemStack.EMPTY));
+		if (!had.isEmpty()) {
+			Vec3 at = frame.position();
+			if (command.has("drop_at") && command.get("drop_at").isJsonArray()) {
+				JsonArray p = command.getAsJsonArray("drop_at");
+				at = new Vec3(p.get(0).getAsDouble(), p.get(1).getAsDouble(), p.get(2).getAsDouble());
+			}
+			ItemEntity dropped = new ItemEntity(level, at.x, at.y, at.z, had, 0, 0, 0);
+			dropped.setUnlimitedLifetime();
+			level.addFreshEntity(dropped);
+		}
+
+		return report(id, true, kind.isPresent() || had.isEmpty() ? "" : "dropped " + BuiltInRegistries.ITEM.getKey(had.getItem()));
+	}
+
+	private static JsonObject equipEntity(ServerLevel level, JsonObject command, long id, WorldData data) {
+		Entity entity = level.getEntity(command.get("entity").getAsInt());
+		if (!(entity instanceof net.minecraft.world.entity.LivingEntity living) || entity instanceof ServerPlayer) {
+			return report(id, false, "no entity that wears things with that id here");
+		}
+
+		// The very stack kept (ABI 27: the scarecrow wears their own helmet), or a plain one.
+		ItemStack stack = stackOf(command, data);
+		if (stack == null || stack.isEmpty()) {
+			return report(id, false, "no such item, or nothing kept under that name");
+		}
+		net.minecraft.world.entity.EquipmentSlot slot = living.getEquipmentSlotForItem(stack);
+		if (!living.getItemBySlot(slot).isEmpty()) {
+			// Their piece, taken for it, at the stand's feet where they will find it, for good:
+			// kept out of sight it was never given back, and a later piece overwrote it.
+			if (command.has("kept") && !command.get("kept").getAsString().isEmpty()) {
+				net.minecraft.world.entity.item.ItemEntity dropped = new net.minecraft.world.entity.item.ItemEntity(level, entity.getX(), entity.getY() + 0.3, entity.getZ(), stack);
+				dropped.setUnlimitedLifetime();
+				level.addFreshEntity(dropped);
+			}
+			return report(id, false, "that slot is worn already");
+		}
+		living.setItemSlot(slot, stack);
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject damageItem(ServerLevel level, JsonObject command, long id) {
+		Container container = container(level, blockPos(command.getAsJsonArray("pos")));
+		if (container == null) {
+			return report(id, false, "no container there");
+		}
+
+		int slot = command.get("slot").getAsInt();
+		if (slot < 0 || slot >= container.getContainerSize()) {
+			return report(id, false, "no such slot");
+		}
+		ItemStack stack = container.getItem(slot);
+		if (stack.isEmpty() || !stack.isDamageableItem()) {
+			return report(id, false, "nothing with wear in that slot");
+		}
+
+		// Worn, never broken: the damage stops one short of the item's end.
+		int amount = command.get("amount").getAsInt();
+		stack.setDamageValue(Math.min(stack.getMaxDamage() - 1, stack.getDamageValue() + Math.max(0, amount)));
+		container.setChanged();
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject pushEntity(ServerLevel level, JsonObject command, long id) {
+		Entity entity = level.getEntity(command.get("entity").getAsInt());
+		if (entity == null || entity instanceof ServerPlayer) {
+			return report(id, false, "no pushable entity with that id here");
+		}
+
+		JsonArray v = command.getAsJsonArray("velocity");
+		entity.setDeltaMovement(v.get(0).getAsDouble(), v.get(1).getAsDouble(), v.get(2).getAsDouble());
+		entity.needsSync = true;
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject playerList(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+
+		java.util.UUID ghost = java.util.UUID.randomUUID();
+		com.mojang.authlib.GameProfile profile = new com.mojang.authlib.GameProfile(ghost, player.getGameProfile().name());
+		var entry = new net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket.Entry(
+				ghost, profile, true, 0, net.minecraft.world.level.GameType.SURVIVAL, null, true, 0, null);
+		var packet = new net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket(
+				java.util.EnumSet.of(net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket.Action.ADD_PLAYER,
+						net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LISTED,
+						net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LATENCY),
+				List.of());
+		// The packet's entries are built from players; a ghost has none, so it is set by hand.
+		packet = withEntries(packet, List.of(entry));
+		player.connection.send(packet);
+		// Taken out through the connection even after a respawn, which shares it (until
+		// now a death left the ghost in the list until they rejoined).
+		context.later().at(command.get("seconds").getAsFloat(), () -> {
+			if (player.connection != null) {
+				player.connection.send(new net.minecraft.network.protocol.game.ClientboundPlayerInfoRemovePacket(List.of(ghost)));
+			}
+		});
+
+		return report(id, true, "");
+	}
+
+	/** The game's death lines that name the one who died and no one else. */
+	private static final List<String> DEATHS = List.of("death.fell.accident.generic", "death.attack.drown", "death.attack.inWall",
+			"death.attack.outOfWorld", "death.attack.generic", "death.attack.starve", "death.attack.freeze");
+
+	/** A player's own entry in their list with this latency: -1 shows no connection. */
+	private static net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket latency(ServerPlayer player, int latency) {
+		var entry = new net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket.Entry(
+				player.getUUID(), player.getGameProfile(), true, latency, player.gameMode.getGameModeForPlayer(), null, true, 0, null);
+		var packet = new net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket(
+				java.util.EnumSet.of(net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket.Action.UPDATE_LATENCY), List.of());
+
+		return withEntries(packet, List.of(entry));
+	}
+
+	/** A player-info packet with these entries, written through its own codec since the entries field is private. */
+	static net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket withEntries(
+			net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket packet,
+			List<net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket.Entry> entries) {
+		try {
+			java.lang.reflect.Field field = null;
+			for (java.lang.reflect.Field candidate : packet.getClass().getDeclaredFields()) {
+				if (List.class.isAssignableFrom(candidate.getType())) {
+					field = candidate;
+				}
+			}
+			if (field == null) {
+				throw new IllegalStateException("no entries field");
+			}
+			field.setAccessible(true);
+			field.set(packet, entries);
+
+			return packet;
+		} catch (ReflectiveOperationException e) {
+			throw new IllegalStateException("could not set the player list entries", e);
+		}
+	}
+
+	private static JsonObject gameMessage(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+
+		String message = command.get("message").getAsString();
+		String text = command.has("text") ? command.get("text").getAsString() : "";
+		Component name = player.getName();
+		switch (message) {
+			case "joined" -> player.sendSystemMessage(Component.translatable("multiplayer.player.joined", name).withStyle(net.minecraft.ChatFormatting.YELLOW));
+			case "left" -> player.sendSystemMessage(Component.translatable("multiplayer.player.left", name).withStyle(net.minecraft.ChatFormatting.YELLOW));
+			case "says" -> player.sendSystemMessage(Component.translatable("chat.type.text", name, Component.literal(text)));
+			case "whisper" -> player.sendSystemMessage(Component.translatable("commands.message.display.incoming", name, Component.literal(text)).withStyle(net.minecraft.ChatFormatting.GRAY, net.minecraft.ChatFormatting.ITALIC));
+			case "sleepers" -> player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetActionBarTextPacket(Component.translatable("sleep.players_sleeping", 1, 2)));
+			case "bed_occupied" -> player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetActionBarTextPacket(Component.translatable("block.minecraft.bed.occupied")));
+			// One of theirs again, as if just earned: the chat line, and the toast on their client.
+			case "advancement" -> {
+				List<net.minecraft.advancements.AdvancementHolder> had = new ArrayList<>();
+				for (net.minecraft.advancements.AdvancementHolder holder : level.getServer().getAdvancements().getAllAdvancements()) {
+					var display = holder.value().display();
+					if (display.isPresent() && display.get().announceToChat() && !display.get().hidden()
+							&& player.getAdvancements().getOrStartProgress(holder).isDone()) {
+						had.add(holder);
+					}
+				}
+				if (had.isEmpty()) {
+					return report(id, false, "they have no advancement to show");
+				}
+				var holder = had.get((int) (Math.abs(text.hashCode() + id) % had.size()));
+				player.sendSystemMessage(holder.value().display().get().type().createAnnouncement(holder, player));
+				context.sendHint().accept(player, new craftkit.host.net.HintPayload("advancement_toast", Optional.empty(), 1f, holder.id().toString()));
+			}
+			// A death message about them while they live (ABI 28): only the game's own one-name lines.
+			case "death" -> {
+				if (!DEATHS.contains(text)) {
+					return report(id, false, "no such death message");
+				}
+				player.sendSystemMessage(Component.translatable(text, name));
+			}
+			// Their own entry in the list shows no connection for a minute.
+			case "no_ping" -> {
+				player.connection.send(latency(player, -1));
+				context.later().at(60f, () -> {
+					if (!player.isRemoved()) {
+						player.connection.send(latency(player, player.connection.latency()));
+					}
+				});
+			}
+			default -> {
+				return report(id, false, "no message kind called " + message);
+			}
+		}
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject moveBlock(ServerLevel level, JsonObject command, long id) {
+		BlockPos from = blockPos(command.getAsJsonArray("from"));
+		BlockPos to = blockPos(command.getAsJsonArray("to"));
+		int around = command.has("around") ? Math.clamp(command.get("around").getAsInt(), 0, 8) : 0;
+		BlockState state = level.getBlockState(from);
+		if (state.isAir()) {
+			return report(id, false, "nothing at the source");
+		}
+
+		// A single-block container goes with what it holds; a chest may be half of two.
+		BlockEntity entity = level.getBlockEntity(from);
+		Container holds = entity instanceof Container c && !(state.getBlock() instanceof net.minecraft.world.level.block.ChestBlock) ? c : null;
+		if (entity != null && holds == null) {
+			return report(id, false, "a block with contents is not moved this way");
+		}
+
+		BlockPos at = null;
+		for (int[] offset : Moves.offsets(around)) {
+			BlockPos candidate = to.offset(offset[0], offset[1], offset[2]);
+			// Inside the world: past its top or bottom every block reads as air and nothing
+			// can be set there (until now the block and its contents were lost).
+			if (level.isOutsideBuildHeight(candidate)) {
+				continue;
+			}
+			// A torch is moved as a player would move it: never to where nothing holds it; a box
+			// moved around sits on something solid.
+			if (candidate.equals(from) || !level.getBlockState(candidate).isAir() || !state.canSurvive(level, candidate)) {
+				continue;
+			}
+			if (around > 0 && !level.getBlockState(candidate.below()).isFaceSturdy(level, candidate.below(), Direction.UP)) {
+				continue;
+			}
+			at = candidate;
+			break;
+		}
+		if (at == null) {
+			return report(id, false, around > 0 ? "no room around the destination" : "the destination is not empty, or nothing holds it there");
+		}
+
+		List<ItemStack> contents = new ArrayList<>();
+		if (holds != null) {
+			for (int slot = 0; slot < holds.getContainerSize(); slot++) {
+				contents.add(holds.getItem(slot).copy());
+				holds.setItem(slot, ItemStack.EMPTY);
+			}
+		}
+		level.setBlock(from, Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL);
+		level.setBlock(at, state, Block.UPDATE_ALL);
+		if (holds != null && level.getBlockEntity(at) instanceof Container moved) {
+			for (int slot = 0; slot < Math.min(contents.size(), moved.getContainerSize()); slot++) {
+				moved.setItem(slot, contents.get(slot));
+			}
+			moved.setChanged();
+		}
+
+		return report(id, true, "");
+	}
+
+	/**
+	 * How a block it sets is placed: as a player would, but a carved pumpkin or a head never
+	 * wakes what it tops (a snowman's head made a snow golem, a skull on soul sand a wither:
+	 * their placing is what spawns them).
+	 */
+	static int placeFlags(BlockState state) {
+		boolean wakes = state.getBlock() instanceof net.minecraft.world.level.block.CarvedPumpkinBlock
+				|| state.getBlock() instanceof net.minecraft.world.level.block.AbstractSkullBlock;
+		return wakes ? Block.UPDATE_ALL | Block.UPDATE_SKIP_ON_PLACE : Block.UPDATE_ALL;
+	}
+
+	/**
+	 * A block's place from a command: as given, or, with its y below -1000, counted from the
+	 * ground in its column ({@link Settle#GROUND} the ground's own block, a block more each one up);
+	 * null when that column is not loaded. The mind knows its place's x and z, not the ground's
+	 * height there: a hole dug at the home's floor height went into the air on lower ground.
+	 */
+	static BlockPos onGround(ServerLevel level, BlockPos pos) {
+		if (pos.getY() > -1000) {
+			return pos;
+		}
+		BlockPos column = new BlockPos(pos.getX(), 0, pos.getZ());
+		if (!level.isLoaded(column)) {
+			return null;
+		}
+		int top = level.getHeightmapPos(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, column).getY() - 1;
+		return new BlockPos(pos.getX(), Settle.fromGround(top, pos.getY()), pos.getZ());
+	}
+
+	private static JsonObject setBlock(ServerLevel level, JsonObject command, long id) {
+		BlockPos pos = onGround(level, blockPos(command.getAsJsonArray("pos")));
+		if (pos == null) {
+			return report(id, false, "the place is not loaded");
+		}
+		List<String> replace = replaceable(command);
+		int settle = command.has("settle") ? command.get("settle").getAsInt() : 0;
+		String wallId = command.has("wall") ? command.get("wall").getAsString() : "";
+		boolean rest = command.has("rest") && command.get("rest").getAsBoolean();
+		boolean only = command.has("only") && command.get("only").getAsBoolean();
+
+		Optional<Holder.Reference<Block>> block = BuiltInRegistries.BLOCK.get(Identifier.parse(blockId(command)));
+		Optional<Holder.Reference<Block>> wall = wallId.isEmpty() ? Optional.empty() : BuiltInRegistries.BLOCK.get(Identifier.parse(wallId));
+		if (block.isEmpty() || (!wallId.isEmpty() && wall.isEmpty())) {
+			return report(id, false, "no such block");
+		}
+
+		// The nearest spot first, down before up, standing before against a wall: a torch on the
+		// path goes on the ground below the slope before it goes on the hill beside it.
+		String why = "nothing holds it there";
+		for (int dy : Settle.order(settle)) {
+			BlockPos at = pos.above(dy);
+			String taken = taken(level, at, replace, only);
+			if (taken != null) {
+				why = dy == 0 ? taken : why;
+				continue;
+			}
+			// A fence's or a wall's top holds a head on its post too, though it is no full face
+			// (`head_on_post` left a bare post every time).
+			BlockState under = level.getBlockState(at.below());
+			if (rest && !under.isFaceSturdy(level, at.below(), Direction.UP)
+					&& !under.is(net.minecraft.tags.BlockTags.FENCES) && !under.is(net.minecraft.tags.BlockTags.WALLS)) {
+				why = dy == 0 ? "nothing under it" : why;
+				continue;
+			}
+			BlockState standing = withState(block.get().value().defaultBlockState(), command.has("state") ? command.get("state").getAsString() : "");
+			if (standing.canSurvive(level, at)) {
+				// What was there is the mod's now, as a player's dig is: said, so it can count it.
+				String was = Senses.blockId(level.getBlockState(at));
+				level.setBlock(at, standing, placeFlags(standing));
+				return report(id, true, level.getBlockState(at).isAir() && !was.equals("minecraft:air") ? "replaced " + was : "");
+			}
+		}
+		if (wall.isPresent()) {
+			for (int dy : Settle.order(settle)) {
+				BlockPos at = pos.above(dy);
+				if (taken(level, at, replace, only) != null) {
+					continue;
+				}
+				BlockState onWall = againstWall(level, at, wall.get().value().defaultBlockState());
+				if (onWall != null) {
+					level.setBlock(at, onWall, placeFlags(onWall));
+					return report(id, true, "");
+				}
+			}
+		}
+
+		return report(id, false, why);
+	}
+
+	private static String blockId(JsonObject command) {
+		return command.get("block").getAsString();
+	}
+
+	/**
+	 * Why a block may not go at {@code pos}, or null when it may. Nothing a player built is ever
+	 * destroyed: a block goes where there is nothing, or over one of the blocks the mod named,
+	 * which it keeps to natural ground.
+	 */
+	/**
+	 * Whether a block is one of {@code replace}: by its id, or by its id and a state in brackets
+	 * ({@code minecraft:wheat[age=7]}, a ripe crop alone).
+	 */
+	static boolean replaces(BlockState there, List<String> replace) {
+		String id = Senses.blockId(there);
+		for (String entry : replace) {
+			int bracket = entry.indexOf('[');
+			if (bracket < 0) {
+				if (entry.equals(id)) {
+					return true;
+				}
+			} else if (entry.substring(0, bracket).equals(id)) {
+				String wanted = entry.substring(bracket + 1, entry.length() - 1);
+				boolean all = true;
+				for (String pair : wanted.split(",")) {
+					String[] kv = pair.split("=", 2);
+					var property = there.getBlock().getStateDefinition().getProperty(kv[0].trim());
+					if (property == null || kv.length < 2 || !there.getValue(property).toString().equalsIgnoreCase(kv[1].trim())) {
+						all = false;
+					}
+				}
+				if (all) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	private static String taken(ServerLevel level, BlockPos pos, List<String> replace, boolean only) {
+		BlockState there = level.getBlockState(pos);
+		if (only && !replaces(there, replace)) {
+			return there.isAir() ? "nothing to replace there" : "the place holds " + Senses.blockId(there);
+		}
+		if (!there.isAir() && !replaces(there, replace)) {
+			return "the place holds " + Senses.blockId(there);
+		}
+		if (level.getBlockEntity(pos) != null) {
+			return "a block with contents is never replaced";
+		}
+
+		return null;
+	}
+
+	/** The wall block facing out from the first side that holds it, or null if none does. */
+	private static BlockState againstWall(ServerLevel level, BlockPos pos, BlockState wall) {
+		if (!wall.hasProperty(BlockStateProperties.HORIZONTAL_FACING)) {
+			return wall.canSurvive(level, pos) ? wall : null;
+		}
+		for (Direction facing : Direction.Plane.HORIZONTAL) {
+			BlockState state = wall.setValue(BlockStateProperties.HORIZONTAL_FACING, facing);
+			if (state.canSurvive(level, pos)) {
+				return state;
+			}
+		}
+
+		return null;
+	}
+
+	private static JsonObject moveItem(ServerLevel level, JsonObject command, long id) {
+		Container from = container(level, blockPos(command.getAsJsonArray("from")));
+		Container to = container(level, blockPos(command.getAsJsonArray("to")));
+		if (from == null || to == null) {
+			return report(id, false, "no container at " + (from == null ? "the source" : "the destination"));
+		}
+
+		int fromSlot = command.get("from_slot").getAsInt();
+		int toSlot = command.get("to_slot").getAsInt();
+		int count = command.get("count").getAsInt();
+		if (fromSlot < 0 || fromSlot >= from.getContainerSize() || toSlot < 0 || toSlot >= to.getContainerSize()) {
+			return report(id, false, "no such slot");
+		}
+
+		// What is there now, up to the count: a chest changes while no one watches it.
+		ItemStack source = from.getItem(fromSlot);
+		if (source.isEmpty()) {
+			// The slot asked is empty: the first that is not (a hopper no one has looked in).
+			for (int candidate : Slots.order(fromSlot, from.getContainerSize())) {
+				if (!from.getItem(candidate).isEmpty()) {
+					fromSlot = candidate;
+					source = from.getItem(candidate);
+					break;
+				}
+			}
+		}
+		if (source.isEmpty()) {
+			return report(id, false, "nothing in the source");
+		}
+		count = Math.min(count, source.getCount());
+
+		// The slot asked for, else a matching stack with room, else the first empty one.
+		int slot = -1;
+		for (int candidate : Slots.order(toSlot, to.getContainerSize())) {
+			if (to == from && candidate == fromSlot) {
+				continue;
+			}
+			ItemStack there = to.getItem(candidate);
+			if (there.isEmpty() || (ItemStack.isSameItemSameComponents(there, source) && there.getCount() + count <= there.getMaxStackSize())) {
+				slot = candidate;
+				break;
+			}
+		}
+		if (slot < 0) {
+			return report(id, false, "the destination is full");
+		}
+
+		ItemStack moved = source.split(count);
+		ItemStack target = to.getItem(slot);
+		if (target.isEmpty()) {
+			to.setItem(slot, moved);
+		} else {
+			target.grow(moved.getCount());
+		}
+		from.setChanged();
+		to.setChanged();
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject takeItem(ServerLevel level, JsonObject command, long id, WorldData data) {
+		Container from = container(level, blockPos(command.getAsJsonArray("from")));
+		if (from == null) {
+			return report(id, false, "no container at the source");
+		}
+
+		int slot = command.get("slot").getAsInt();
+		int count = command.get("count").getAsInt();
+		if (slot < 0 || slot >= from.getContainerSize()) {
+			return report(id, false, "no such slot");
+		}
+
+		// The item it means (ABI 52): the chest changed since it was seen, and what is in that
+		// slot now is not taken in its place (with no key, it was spent and gone). That item in
+		// another slot is.
+		String expect = command.has("expect") ? command.get("expect").getAsString() : "";
+		if (!expect.isEmpty() && !BuiltInRegistries.ITEM.getKey(from.getItem(slot).getItem()).toString().equals(expect)) {
+			slot = -1;
+			for (int candidate = 0; candidate < from.getContainerSize(); candidate++) {
+				ItemStack there = from.getItem(candidate);
+				if (!there.isEmpty() && there.getCount() >= count && BuiltInRegistries.ITEM.getKey(there.getItem()).toString().equals(expect)) {
+					slot = candidate;
+					break;
+				}
+			}
+			if (slot < 0) {
+				return report(id, false, "not there any more");
+			}
+		}
+
+		ItemStack source = from.getItem(slot);
+		if (source.isEmpty() || source.getCount() < count) {
+			return report(id, false, "the slot has too few");
+		}
+
+		// What it takes it holds: the very stack, kept with the world, when the mod names a key.
+		// With no key the mod spends it (a sapling planted, ladders laid, the makings of what it
+		// crafts): the docs of `take_item` say so.
+		// Taken as the container takes it: a chiseled bookshelf's or a jukebox's split by hand
+		// left the shelf showing the book and the disc playing.
+		ItemStack taken = from.removeItem(slot, count);
+		if (command.has("keep") && !command.get("keep").getAsString().isEmpty()) {
+			data.keep(command.get("keep").getAsString(), taken);
+		}
+		from.setChanged();
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject signBook(ServerLevel level, JsonObject command, long id) {
+		Container in = container(level, blockPos(command.getAsJsonArray("pos")));
+		int slot = command.get("slot").getAsInt();
+		if (in == null || slot < 0 || slot >= in.getContainerSize() || !in.getItem(slot).is(net.minecraft.world.item.Items.WRITABLE_BOOK)) {
+			return report(id, false, "no book and quill there");
+		}
+		// Never one they wrote in: signed with its word alone, their pages were gone.
+		var theirs = in.getItem(slot).get(net.minecraft.core.component.DataComponents.WRITABLE_BOOK_CONTENT);
+		if (theirs != null && theirs.pages().stream().anyMatch(page -> !page.raw().isBlank())) {
+			return report(id, false, "the book has their writing in it");
+		}
+		List<net.minecraft.server.network.Filterable<Component>> pages = new ArrayList<>();
+		for (JsonElement page : command.getAsJsonArray("pages")) {
+			pages.add(net.minecraft.server.network.Filterable.passThrough(Component.literal(page.getAsString())));
+		}
+		String title = command.get("title").getAsString();
+		ItemStack written = in.getItem(slot).transmuteCopy(net.minecraft.world.item.Items.WRITTEN_BOOK, 1);
+		written.set(net.minecraft.core.component.DataComponents.WRITTEN_BOOK_CONTENT,
+				new net.minecraft.world.item.component.WrittenBookContent(net.minecraft.server.network.Filterable.passThrough(title.isEmpty() ? " " : title), "", 0, pages, true));
+		in.setItem(slot, written);
+		in.setChanged();
+
+		return report(id, true, "");
+	}
+
+	/**
+	 * A written book made and kept under a name (ABI 51), for a sale, a chest, a lectern or a
+	 * villager's hands: the title, the author, the pages as given, each a page of the book.
+	 */
+	private static JsonObject writeBook(JsonObject command, long id, WorldData data) {
+		List<net.minecraft.server.network.Filterable<Component>> pages = new ArrayList<>();
+		for (JsonElement page : command.getAsJsonArray("pages")) {
+			String text = page.getAsString();
+			pages.add(net.minecraft.server.network.Filterable.passThrough(Component.literal(text.length() > 1000 ? text.substring(0, 1000) : text)));
+			if (pages.size() >= 50) {
+				break;
+			}
+		}
+		if (pages.isEmpty()) {
+			return report(id, false, "a book of no pages");
+		}
+		String title = command.get("title").getAsString();
+		title = title.isBlank() ? " " : title.length() > 32 ? title.substring(0, 32) : title;
+		ItemStack book = new ItemStack(net.minecraft.world.item.Items.WRITTEN_BOOK);
+		book.set(net.minecraft.core.component.DataComponents.WRITTEN_BOOK_CONTENT,
+				new net.minecraft.world.item.component.WrittenBookContent(net.minecraft.server.network.Filterable.passThrough(title),
+						command.has("author") ? command.get("author").getAsString() : "", 0, pages, true));
+		data.keep(command.get("kept").getAsString(), book);
+
+		return report(id, true, "");
+	}
+
+	/** One page more in a book and quill of theirs, after what they wrote; theirs stay as they are (ABI 51). */
+	private static JsonObject addPage(ServerLevel level, JsonObject command, long id) {
+		Container in = container(level, blockPos(command.getAsJsonArray("pos")));
+		int slot = command.get("slot").getAsInt();
+		if (in == null || slot < 0 || slot >= in.getContainerSize() || !in.getItem(slot).is(net.minecraft.world.item.Items.WRITABLE_BOOK)) {
+			return report(id, false, "no book and quill there");
+		}
+		ItemStack book = in.getItem(slot);
+		var content = book.getOrDefault(net.minecraft.core.component.DataComponents.WRITABLE_BOOK_CONTENT, net.minecraft.world.item.component.WritableBookContent.EMPTY);
+		if (content.pages().size() >= 100) {
+			return report(id, false, "the book is full");
+		}
+		List<net.minecraft.server.network.Filterable<String>> pages = new ArrayList<>(content.pages());
+		String page = command.get("page").getAsString();
+		pages.add(net.minecraft.server.network.Filterable.passThrough(page.length() > 1000 ? page.substring(0, 1000) : page));
+		book.set(net.minecraft.core.component.DataComponents.WRITABLE_BOOK_CONTENT, new net.minecraft.world.item.component.WritableBookContent(pages));
+		in.setChanged();
+
+		return report(id, true, "");
+	}
+
+	/** A kept book onto a lectern that holds none (ABI 51). */
+	private static JsonObject putBook(ServerLevel level, JsonObject command, long id, WorldData data) {
+		// The lectern asked, or the first of the others the mind names that holds no book (ABI
+		// 53: its lecterns out of their view; a search around one could find one before them).
+		List<BlockPos> candidates = new ArrayList<>();
+		candidates.add(blockPos(command.getAsJsonArray("pos")));
+		if (command.has("also")) {
+			for (JsonElement at : command.getAsJsonArray("also")) {
+				candidates.add(blockPos(at.getAsJsonArray()));
+			}
+		}
+		BlockPos pos = null;
+		for (BlockPos at : candidates) {
+			if (level.isLoaded(at) && level.getBlockEntity(at) instanceof net.minecraft.world.level.block.entity.LecternBlockEntity free && !free.hasBook()) {
+				pos = at;
+				break;
+			}
+		}
+		if (pos == null || !(level.getBlockEntity(pos) instanceof net.minecraft.world.level.block.entity.LecternBlockEntity lectern)) {
+			return report(id, false, "no lectern without a book there");
+		}
+		BlockState state = level.getBlockState(pos);
+		ItemStack book = data.giveBack(command.get("kept").getAsString());
+		if (book == null || book.isEmpty()) {
+			return report(id, false, "nothing kept under that name");
+		}
+		lectern.setBook(book);
+		net.minecraft.world.level.block.LecternBlock.resetBookState(null, level, pos, state, true);
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject markMap(ServerLevel level, JsonObject command, long id) {
+		Container in = container(level, blockPos(command.getAsJsonArray("pos")));
+		int slot = command.get("slot").getAsInt();
+		if (in == null || slot < 0 || slot >= in.getContainerSize() || !in.getItem(slot).is(net.minecraft.world.item.Items.FILLED_MAP)) {
+			return report(id, false, "no map there");
+		}
+		net.minecraft.world.level.saveddata.maps.MapItemSavedData.addTargetDecoration(in.getItem(slot), blockPos(command.getAsJsonArray("at")), "craftkit", net.minecraft.world.level.saveddata.maps.MapDecorationTypes.TARGET_X);
+		in.setChanged();
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject renameItem(ServerLevel level, JsonObject command, long id) {
+		Container in = container(level, blockPos(command.getAsJsonArray("pos")));
+		if (in == null) {
+			return report(id, false, "no container there");
+		}
+		int slot = command.get("slot").getAsInt();
+		if (slot < 0 || slot >= in.getContainerSize() || in.getItem(slot).isEmpty()) {
+			return report(id, false, "nothing in that slot");
+		}
+		in.getItem(slot).set(net.minecraft.core.component.DataComponents.CUSTOM_NAME, Component.literal(command.get("name").getAsString()));
+		in.setChanged();
+
+		return report(id, true, "");
+	}
+
+	/** The stack a give-back command means: the kept one when it names a key, else one made from its item. */
+	private static ItemStack stackOf(JsonObject command, WorldData data) {
+		if (command.has("kept") && !command.get("kept").getAsString().isEmpty()) {
+			return data.giveBack(command.get("kept").getAsString());
+		}
+		JsonObject item = command.getAsJsonObject("item");
+		Optional<Holder.Reference<Item>> kind = BuiltInRegistries.ITEM.get(Identifier.parse(item.get("id").getAsString()));
+
+		return kind.map(k -> new ItemStack(k.value(), item.get("count").getAsInt())).orElse(null);
+	}
+
+	private static JsonObject putItem(ServerLevel level, JsonObject command, long id, WorldData data) {
+		Container into = container(level, blockPos(command.getAsJsonArray("into")));
+		if (into == null) {
+			return report(id, false, "no container at the destination");
+		}
+
+		ItemStack stack = stackOf(command, data);
+		if (stack == null || stack.isEmpty()) {
+			return report(id, false, "no such item, or nothing kept under that name");
+		}
+		// The slot it was taken from, or any free one: a slot the container no longer has (a
+		// double chest broken in half) is any free one too, and the kept stack is never lost.
+		int slot = -1;
+		if (command.has("slot") && !command.get("slot").isJsonNull()) {
+			int wanted = command.get("slot").getAsInt();
+			if (wanted >= 0 && wanted < into.getContainerSize() && into.getItem(wanted).isEmpty() && into.canPlaceItem(wanted, stack)) {
+				slot = wanted;
+			}
+		}
+		// A slot that takes it: a chiseled bookshelf throws away what is not a book.
+		if (slot < 0) {
+			for (int candidate = 0; candidate < into.getContainerSize(); candidate++) {
+				if (into.getItem(candidate).isEmpty() && into.canPlaceItem(candidate, stack)) {
+					slot = candidate;
+					break;
+				}
+			}
+		}
+
+		if (slot < 0) {
+			// Never lost: what does not fit goes back to where it was kept, as it was (the wear
+			// and the name only once it goes in, so a retry does not wear it twice).
+			if (command.has("kept") && !command.get("kept").getAsString().isEmpty()) {
+				data.keep(command.get("kept").getAsString(), stack);
+			}
+			return report(id, false, "the container is full, or takes no such thing");
+		}
+
+		// As it goes back: a little more wear (never broken by it), a name.
+		int wear = command.has("wear") ? command.get("wear").getAsInt() : 0;
+		if (wear > 0 && stack.isDamageableItem()) {
+			stack.setDamageValue(Math.min(stack.getMaxDamage() - 1, stack.getDamageValue() + wear));
+		}
+		if (command.has("name") && !command.get("name").getAsString().isEmpty()) {
+			stack.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME, Component.literal(command.get("name").getAsString()));
+		}
+		into.setItem(slot, stack);
+		into.setChanged();
+
+		return report(id, true, "");
+	}
+
+	/**
+	 * Villagers in a panic, running from the player (ABI 54): each remembers it was hurt by them
+	 * for the time, which their brain flees from as from a zombie. Only the memory: no hurt, so
+	 * no gossip and no golem's anger.
+	 */
+	private static JsonObject panic(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		long ticks = (long) (Math.min(command.get("seconds").getAsFloat(), 120) * 20);
+		int panicked = 0;
+		for (JsonElement each : command.getAsJsonArray("entities")) {
+			if (level.getEntity(each.getAsInt()) instanceof net.minecraft.world.entity.npc.villager.AbstractVillager villager) {
+				var brain = villager.getBrain();
+				brain.setMemoryWithExpiry(net.minecraft.world.entity.ai.memory.MemoryModuleType.HURT_BY_ENTITY, player, ticks);
+				brain.setMemoryWithExpiry(net.minecraft.world.entity.ai.memory.MemoryModuleType.HURT_BY, level.damageSources().mobAttack(player), ticks);
+				panicked++;
+			}
+		}
+
+		return panicked > 0 ? report(id, true, "") : report(id, false, "none of them here");
+	}
+
+	/**
+	 * A tree brought down (ABI 54, {@link Felled}): every log of the column over the stump moved
+	 * out along the way it falls to its height and dropped from there as a falling block, so it
+	 * lies on the ground as a felled tree; a log whose place is not air, or too near them, stays.
+	 */
+	private static JsonObject fellTree(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		BlockPos stump = blockPos(command.getAsJsonArray("trunk"));
+		JsonArray toward = command.getAsJsonArray("toward");
+		int[] way = Felled.way(toward.get(0).getAsDouble() - (stump.getX() + 0.5), toward.get(2).getAsDouble() - (stump.getZ() + 0.5));
+		List<BlockPos> logs = new ArrayList<>();
+		for (BlockPos p = stump.above(); level.getBlockState(p).is(net.minecraft.tags.BlockTags.LOGS) && logs.size() < 24; p = p.above()) {
+			logs.add(p.immutable());
+		}
+		if (logs.isEmpty()) {
+			return report(id, false, "nothing over the stump");
+		}
+		double px = player == null ? Double.MAX_VALUE : player.getX();
+		double pz = player == null ? Double.MAX_VALUE : player.getZ();
+		int felled = 0;
+		for (BlockPos log : logs) {
+			int up = log.getY() - stump.getY();
+			int[] out = Felled.lies(up, way);
+			BlockPos to = new BlockPos(stump.getX() + out[0], log.getY(), stump.getZ() + out[1]);
+			if (!level.getBlockState(to).isAir() || Felled.nearThem(to.getX(), to.getZ(), px, pz)) {
+				continue;
+			}
+			BlockState state = level.getBlockState(log);
+			if (state.hasProperty(net.minecraft.world.level.block.RotatedPillarBlock.AXIS)) {
+				state = state.setValue(net.minecraft.world.level.block.RotatedPillarBlock.AXIS,
+						way[0] != 0 ? net.minecraft.core.Direction.Axis.X : net.minecraft.core.Direction.Axis.Z);
+			}
+			level.setBlock(log, Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL);
+			level.setBlock(to, state, Block.UPDATE_ALL);
+			net.minecraft.world.entity.item.FallingBlockEntity.fall(level, to, state);
+			felled++;
+		}
+		if (felled == 0) {
+			return report(id, false, "no room for it to fall");
+		}
+		if (player != null) {
+			player.connection.send(new net.minecraft.network.protocol.game.ClientboundSoundPacket(
+					net.minecraft.core.Holder.direct(net.minecraft.sounds.SoundEvents.WOOD_BREAK), net.minecraft.sounds.SoundSource.HOSTILE,
+					stump.getX() + 0.5, stump.getY() + 3, stump.getZ() + 0.5, 1.5f, 0.45f, player.getRandom().nextLong()));
+			player.connection.send(new net.minecraft.network.protocol.game.ClientboundSoundPacket(
+					net.minecraft.sounds.SoundEvents.GENERIC_EXPLODE, net.minecraft.sounds.SoundSource.HOSTILE,
+					stump.getX() + 0.5 + way[0] * 4, stump.getY() + 1, stump.getZ() + 0.5 + way[1] * 4, 0.35f, 0.5f, player.getRandom().nextLong()));
+		}
+
+		return report(id, true, "");
+	}
+
+	/**
+	 * A tree made wrong (ABI 54): its own logs found from the trunk up and out (joined logs, at
+	 * most 160), stripped; and its own leaves round them (never persistent ones) taken away.
+	 */
+	private static JsonObject bareTree(ServerLevel level, JsonObject command, long id) {
+		BlockPos trunk = blockPos(command.getAsJsonArray("trunk"));
+		if (!level.getBlockState(trunk).is(net.minecraft.tags.BlockTags.LOGS)) {
+			return report(id, false, "no tree there");
+		}
+		boolean leaves = command.has("leaves") && command.get("leaves").getAsBoolean();
+		boolean strip = command.has("strip") && command.get("strip").getAsBoolean();
+		// The tree's logs: joined to the trunk, never below it, at most so many.
+		java.util.Set<BlockPos> logs = new java.util.LinkedHashSet<>();
+		java.util.ArrayDeque<BlockPos> open = new java.util.ArrayDeque<>(List.of(trunk));
+		while (!open.isEmpty() && logs.size() < 160) {
+			BlockPos at = open.poll();
+			if (logs.contains(at) || at.getY() < trunk.getY() || !level.getBlockState(at).is(net.minecraft.tags.BlockTags.LOGS)) {
+				continue;
+			}
+			logs.add(at);
+			for (BlockPos next : BlockPos.betweenClosed(at.offset(-1, 0, -1), at.offset(1, 1, 1))) {
+				if (!logs.contains(next)) {
+					open.add(next.immutable());
+				}
+			}
+		}
+		if (leaves) {
+			for (BlockPos log : logs) {
+				for (BlockPos p : BlockPos.betweenClosed(log.offset(-3, -1, -3), log.offset(3, 3, 3))) {
+					BlockState state = level.getBlockState(p);
+					if (state.is(net.minecraft.tags.BlockTags.LEAVES) && state.hasProperty(net.minecraft.world.level.block.LeavesBlock.PERSISTENT)
+							&& !state.getValue(net.minecraft.world.level.block.LeavesBlock.PERSISTENT)) {
+						level.setBlock(p, Blocks.AIR.defaultBlockState(), Block.UPDATE_CLIENTS);
+					}
+				}
+			}
+		}
+		if (strip) {
+			for (BlockPos log : logs) {
+				BlockState state = level.getBlockState(log);
+				Identifier key = BuiltInRegistries.BLOCK.getKey(state.getBlock());
+				if (key.getPath().startsWith("stripped_")) {
+					continue;
+				}
+				BuiltInRegistries.BLOCK.get(Identifier.fromNamespaceAndPath(key.getNamespace(), "stripped_" + key.getPath())).ifPresent(bare -> {
+					BlockState stripped = bare.value().defaultBlockState();
+					if (state.hasProperty(net.minecraft.world.level.block.RotatedPillarBlock.AXIS) && stripped.hasProperty(net.minecraft.world.level.block.RotatedPillarBlock.AXIS)) {
+						stripped = stripped.setValue(net.minecraft.world.level.block.RotatedPillarBlock.AXIS, state.getValue(net.minecraft.world.level.block.RotatedPillarBlock.AXIS));
+					}
+					level.setBlock(log, stripped, Block.UPDATE_CLIENTS);
+				});
+			}
+		}
+
+		return report(id, true, "");
+	}
+
+	/**
+	 * A branch snapping (ABI 54): the crack over the trunk, to the player, and up to four of the
+	 * tree's own leaves (never persistent ones, which someone placed) broken out of its crown.
+	 */
+	private static JsonObject snapBranch(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		BlockPos trunk = blockPos(command.getAsJsonArray("trunk"));
+		List<BlockPos> leaves = new ArrayList<>();
+		for (BlockPos p : BlockPos.betweenClosed(trunk.offset(-2, 3, -2), trunk.offset(2, 10, 2))) {
+			BlockState state = level.getBlockState(p);
+			if (state.is(net.minecraft.tags.BlockTags.LEAVES) && state.hasProperty(net.minecraft.world.level.block.LeavesBlock.PERSISTENT)
+					&& !state.getValue(net.minecraft.world.level.block.LeavesBlock.PERSISTENT)) {
+				leaves.add(p.immutable());
+			}
+		}
+		if (leaves.isEmpty()) {
+			return report(id, false, "no leaves of its own over it");
+		}
+		if (player != null) {
+			player.connection.send(new net.minecraft.network.protocol.game.ClientboundSoundPacket(
+					net.minecraft.core.Holder.direct(net.minecraft.sounds.SoundEvents.WOOD_BREAK), net.minecraft.sounds.SoundSource.HOSTILE,
+					trunk.getX() + 0.5, trunk.getY() + 4, trunk.getZ() + 0.5, 1.2f, 0.55f, player.getRandom().nextLong()));
+		}
+		// The lowest first: the torn branch's, under the crown.
+		leaves.sort(java.util.Comparator.comparingInt(BlockPos::getY));
+		for (int i = 0; i < Math.min(4, leaves.size()); i++) {
+			level.destroyBlock(leaves.get(i), false);
+		}
+
+		return report(id, true, "");
+	}
+
+	/** A stack to take up: where it is, and what it is worth. */
+	private record Valued(Container in, int slot, int worth) {
+	}
+
+	/**
+	 * Their most valuable stacks taken up (ABI 54): from their inventory but what they wear and
+	 * hold, and from the chests named, most valuable first, up to {@code most}, each kept under
+	 * {@code keep_i} and shown to them rising into the sky ({@link Figures#showRising}).
+	 */
+	private static JsonObject takeUp(ServerLevel level, JsonObject command, long id, WorldData data, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null || data == null) {
+			return report(id, false, "the player is not here");
+		}
+		List<Valued> stacks = new ArrayList<>();
+		var inventory = player.getInventory();
+		// The inventory's own slots, 0 to 35: armour and the other hand are apart; the one they hold is left.
+		for (int slot = 0; slot < 36; slot++) {
+			if (slot == inventory.getSelectedSlot()) {
+				continue;
+			}
+			ItemStack stack = inventory.getItem(slot);
+			if (!stack.isEmpty()) {
+				stacks.add(new Valued(inventory, slot, Worth.of(BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(), stack.isEnchanted())));
+			}
+		}
+		for (JsonElement at : command.getAsJsonArray("chests")) {
+			Container chest = container(level, blockPos(at.getAsJsonArray()));
+			if (chest == null) {
+				continue;
+			}
+			for (int slot = 0; slot < chest.getContainerSize(); slot++) {
+				ItemStack stack = chest.getItem(slot);
+				if (!stack.isEmpty()) {
+					stacks.add(new Valued(chest, slot, Worth.of(BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(), stack.isEnchanted())));
+				}
+			}
+		}
+		stacks.removeIf(v -> v.worth() < Worth.LEAST);
+		stacks.sort((a, b) -> Integer.compare(b.worth(), a.worth()));
+		int most = Math.min(command.get("most").getAsInt(), 8);
+		String keep = command.get("keep").getAsString();
+		int taken = 0;
+		for (Valued valued : stacks) {
+			if (taken >= most) {
+				break;
+			}
+			ItemStack stack = valued.in().removeItem(valued.slot(), valued.in().getItem(valued.slot()).getCount());
+			if (stack.isEmpty()) {
+				continue;
+			}
+			valued.in().setChanged();
+			// Kept first, shown after: what is shown is a picture of it, on their screen alone.
+			data.keep(keep + "_" + taken, stack.copy());
+			context.figures().showRising(player, stack, taken * 15);
+			taken++;
+		}
+
+		return taken > 0 ? report(id, true, "took " + taken) : report(id, false, "nothing of worth on them or in their chests");
+	}
+
+	/** Every stack kept under a name beginning with the prefix, dropped high over a place, a moment apart (ABI 54). */
+	private static JsonObject dropKept(ServerLevel level, JsonObject command, long id, WorldData data) {
+		if (data == null) {
+			return report(id, true, "");
+		}
+		JsonArray pos = command.getAsJsonArray("pos");
+		int n = 0;
+		for (String key : data.keysStarting(command.get("prefix").getAsString())) {
+			ItemStack stack = data.giveBack(key);
+			if (stack == null || stack.isEmpty()) {
+				continue;
+			}
+			// Out of the sky: high over the place, each a little apart, so they come down one by one.
+			ItemEntity entity = new ItemEntity(level, pos.get(0).getAsDouble() + (n % 3 - 1) * 0.4, pos.get(1).getAsDouble() + 24 + n * 3,
+					pos.get(2).getAsDouble() + (n / 3 % 3 - 1) * 0.4, stack, 0, 0, 0);
+			entity.setUnlimitedLifetime();
+			level.addFreshEntity(entity);
+			n++;
+		}
+
+		return report(id, true, n == 0 ? "none kept" : "");
+	}
+
+	private static JsonObject dropItem(ServerLevel level, JsonObject command, long id, WorldData data) {
+		ItemStack stack = stackOf(command, data);
+		if (stack == null || stack.isEmpty()) {
+			return report(id, false, "no such item, or nothing kept under that name");
+		}
+
+		JsonArray pos = command.getAsJsonArray("pos");
+		ItemEntity entity = new ItemEntity(level, pos.get(0).getAsDouble(), pos.get(1).getAsDouble(), pos.get(2).getAsDouble(), stack, 0, 0, 0);
+		entity.setUnlimitedLifetime();
+		level.addFreshEntity(entity);
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject setSign(ServerLevel level, JsonObject command, long id) {
+		BlockPos pos = onGround(level, blockPos(command.getAsJsonArray("pos")));
+		if (pos == null) {
+			return report(id, false, "the place is not loaded");
+		}
+		int settle = command.has("settle") ? command.get("settle").getAsInt() : 0;
+		SignBlockEntity sign = null;
+		for (int dy : Settle.order(settle)) {
+			if (level.getBlockEntity(pos.above(dy)) instanceof SignBlockEntity found) {
+				sign = found;
+				break;
+			}
+		}
+		if (sign == null) {
+			return report(id, false, "no sign there");
+		}
+
+		List<Component> lines = new ArrayList<>();
+		if (command.has("one_line") && command.get("one_line").getAsBoolean()) {
+			// One line of theirs, the last with text, reads the word; the rest kept (ABI 28).
+			List<Component> had = sign.getText(SignTextSlot.FRONT).getMessages(false);
+			int last = -1;
+			for (int i = 0; i < SignText.LINES && i < had.size(); i++) {
+				lines.add(had.get(i));
+				if (!had.get(i).getString().isBlank()) {
+					last = i;
+				}
+			}
+			if (last < 0) {
+				return report(id, false, "the sign has no text");
+			}
+			lines.set(last, Component.literal(command.getAsJsonArray("lines").get(0).getAsString()));
+		} else {
+			for (JsonElement line : command.getAsJsonArray("lines")) {
+				lines.add(Component.literal(line.getAsString()));
+			}
+		}
+		while (lines.size() < SignText.LINES) {
+			lines.add(Component.empty());
+		}
+
+		SignText text = new SignText(lines.subList(0, SignText.LINES), lines.subList(0, SignText.LINES), net.minecraft.world.item.DyeColor.BLACK, false);
+		sign.setText(text, SignTextSlot.FRONT);
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject cancelSleep(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+
+		if (player.isSleeping()) {
+			player.stopSleepInBed(true, true);
+			player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetActionBarTextPacket(Component.translatable("block.minecraft.bed.not_safe")));
+		} else {
+			context.senses().refuseSleep(player, command.get("seconds").getAsFloat());
+		}
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject lookAt(ServerLevel level, JsonObject command, long id, Context context) {
+		Entity entity = level.getEntity(command.get("entity").getAsInt());
+		Mob mob = entity == null ? null : Senses.mob(entity);
+		if (mob == null) {
+			return report(id, false, "no mob with that id here");
+		}
+
+		JsonArray at = command.getAsJsonArray("at");
+		context.looks().add(mob, new Vec3(at.get(0).getAsDouble(), at.get(1).getAsDouble(), at.get(2).getAsDouble()), command.get("seconds").getAsFloat());
+
+		return report(id, true, "");
+	}
+
+	/** The farthest a mod may move a player in one go. */
+	static final double MOST_MOVE = 32;
+
+	/** A block's state with `name=value,name=value` applied; what does not fit is left as it was. */
+	static BlockState withState(BlockState state, String properties) {
+		for (String pair : properties.split(",")) {
+			String[] kv = pair.split("=", 2);
+			if (kv.length == 2) {
+				state = withProperty(state, kv[0].trim(), kv[1].trim());
+			}
+		}
+
+		return state;
+	}
+
+	private static <T extends Comparable<T>> BlockState withProperty(BlockState state, String name, String value) {
+		for (net.minecraft.world.level.block.state.properties.Property<?> property : state.getProperties()) {
+			if (property.getName().equals(name)) {
+				@SuppressWarnings("unchecked")
+				net.minecraft.world.level.block.state.properties.Property<T> typed = (net.minecraft.world.level.block.state.properties.Property<T>) property;
+				T now = state.getValue(typed);
+				T next;
+				if (value.equals("@next")) {
+					java.util.List<T> values = new java.util.ArrayList<>(typed.getPossibleValues());
+					next = values.get((values.indexOf(now) + 1) % values.size());
+				} else if (value.equals("@up")) {
+					// One higher, never round to the bottom: a full composter stays full (ABI 29).
+					java.util.List<T> values = new java.util.ArrayList<>(typed.getPossibleValues());
+					java.util.Collections.sort(values);
+					int at = values.indexOf(now);
+					next = at + 1 < values.size() ? values.get(at + 1) : now;
+				} else {
+					next = typed.getValue(value).orElse(now);
+				}
+				return state.setValue(typed, next);
+			}
+		}
+
+		return state;
+	}
+
+	/** Bone meal, as a player uses it, up to `tries` times, until the block is something else. */
+	private static JsonObject grow(ServerLevel level, JsonObject command, long id) {
+		BlockPos pos = blockPos(command.getAsJsonArray("pos"));
+		int tries = Math.clamp(command.get("tries").getAsInt(), 1, 16);
+		BlockState was = level.getBlockState(pos);
+		for (int i = 0; i < tries; i++) {
+			BlockState state = level.getBlockState(pos);
+			if (state.getBlock() != was.getBlock()) {
+				break;
+			}
+			if (!(state.getBlock() instanceof net.minecraft.world.level.block.BonemealableBlock grows)
+					|| !grows.isValidBonemealTarget(level, pos, state, net.minecraft.world.level.block.BonemealSource.INTERACTION)) {
+				return report(id, false, "it will not grow");
+			}
+			if (grows.isBonemealSuccess(level, level.getRandom(), pos, state, net.minecraft.world.level.block.BonemealSource.INTERACTION)) {
+				grows.performBonemeal(level, level.getRandom(), pos, state, net.minecraft.world.level.block.BonemealSource.INTERACTION);
+			}
+		}
+
+		return level.getBlockState(pos).getBlock() != was.getBlock() ? report(id, true, "") : report(id, false, "it did not grow this time");
+	}
+
+	private static JsonObject setState(ServerLevel level, JsonObject command, long id) {
+		BlockPos pos = blockPos(command.getAsJsonArray("pos"));
+		BlockState state = level.getBlockState(pos);
+		String property = command.get("property").getAsString();
+		String value = command.get("value").getAsString();
+		// A bed turned round where it stands: its two halves swap, facing the other way, both
+		// set before either is checked, so it never breaks half way.
+		if (value.equals("@turn") && state.getBlock() instanceof net.minecraft.world.level.block.BedBlock) {
+			Direction facing = state.getValue(net.minecraft.world.level.block.BedBlock.FACING);
+			boolean isHead = state.getValue(net.minecraft.world.level.block.BedBlock.PART) == net.minecraft.world.level.block.state.properties.BedPart.HEAD;
+			BlockPos head = isHead ? pos : pos.relative(facing);
+			BlockPos foot = isHead ? pos.relative(facing.getOpposite()) : pos;
+			BlockState headState = level.getBlockState(head);
+			BlockState footState = level.getBlockState(foot);
+			if (!(headState.getBlock() instanceof net.minecraft.world.level.block.BedBlock) || !(footState.getBlock() instanceof net.minecraft.world.level.block.BedBlock)) {
+				return report(id, false, "not a whole bed");
+			}
+			Direction turned = facing.getOpposite();
+			level.setBlock(foot, headState.setValue(net.minecraft.world.level.block.BedBlock.FACING, turned), Block.UPDATE_CLIENTS);
+			level.setBlock(head, footState.setValue(net.minecraft.world.level.block.BedBlock.FACING, turned), Block.UPDATE_CLIENTS);
+			return report(id, true, "");
+		}
+		BlockState changed = withState(state, property + "=" + value);
+		if (changed == state) {
+			return report(id, false, "the block there has no " + property + " to change");
+		}
+		level.setBlock(pos, changed, Block.UPDATE_ALL);
+		// A door is two blocks: its other half changes with it.
+		if (state.hasProperty(BlockStateProperties.DOUBLE_BLOCK_HALF)) {
+			BlockPos other = state.getValue(BlockStateProperties.DOUBLE_BLOCK_HALF) == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER ? pos.above() : pos.below();
+			BlockState half = level.getBlockState(other);
+			if (half.is(state.getBlock())) {
+				level.setBlock(other, withState(half, property + "=" + changed.getValue(findProperty(changed, property))), Block.UPDATE_ALL);
+			}
+		}
+
+		return report(id, true, "");
+	}
+
+	private static net.minecraft.world.level.block.state.properties.Property<?> findProperty(BlockState state, String name) {
+		return state.getProperties().stream().filter(p -> p.getName().equals(name)).findFirst().orElseThrow();
+	}
+
+	private static JsonObject movePlayer(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		JsonArray to = command.getAsJsonArray("to");
+		Vec3 target = new Vec3(to.get(0).getAsDouble(), to.get(1).getAsDouble(), to.get(2).getAsDouble());
+		if (target.distanceTo(player.position()) > MOST_MOVE) {
+			return report(id, false, "farther than " + (int) MOST_MOVE + " blocks");
+		}
+		// Up to two up, and one down: the ground outside a door can be a step lower than its sill.
+		for (int up : new int[] {0, 1, -1, 2}) {
+			Vec3 at = target.add(0, up, 0);
+			// Ground under them and no water or lava where they stand: a bed by an edge or a
+			// shaft sent them off it, and that fall was no spared one.
+			BlockPos feet = BlockPos.containing(at);
+			BlockPos below = feet.below();
+			boolean ground = level.getBlockState(below).isFaceSturdy(level, below, Direction.UP)
+					|| !level.getBlockState(feet).getCollisionShape(level, feet).isEmpty();
+			if (ground && level.getFluidState(feet).isEmpty()
+					&& level.noCollision(player, player.getDimensions(player.getPose()).makeBoundingBox(at))) {
+				player.teleportTo(at.x, at.y, at.z);
+				return report(id, true, "");
+			}
+		}
+
+		return report(id, false, "no room to stand there");
+	}
+
+	private static JsonObject hold(ServerLevel level, JsonObject command, long id, Context context) {
+		Entity entity = level.getEntity(command.get("entity").getAsInt());
+		Mob mob = entity == null ? null : Senses.mob(entity);
+		if (mob == null) {
+			return report(id, false, "no mob with that id here");
+		}
+		// A warped mob is the warp's to put back: held too, the two would leave it frozen for
+		// good (until now).
+		if (mob.entityTags().contains(Warps.TAG)) {
+			return report(id, false, "the mob is warped");
+		}
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+
+		Vec3 at = null;
+		if (command.has("at") && command.get("at").isJsonArray()) {
+			JsonArray p = command.getAsJsonArray("at");
+			at = new Vec3(p.get(0).getAsDouble(), p.get(1).getAsDouble(), p.get(2).getAsDouble());
+		}
+		boolean creep = command.has("creep") && command.get("creep").getAsBoolean();
+		context.holds().add(mob, player, command.get("seconds").getAsFloat(), at, 0, creep);
+		if (command.has("spin") && command.get("spin").getAsBoolean()) {
+			context.holds().spin(mob);
+		}
+
+		return report(id, true, "");
+	}
+
+	/** What {@code place_entity} may place: an armour stand, a farm animal, or a bat (`bats_in_the_house`, ABI 54). */
+	private static final List<String> PLACEABLE = List.of("minecraft:armor_stand", "minecraft:cow", "minecraft:pig", "minecraft:sheep",
+			"minecraft:chicken", "minecraft:goat", "minecraft:horse", "minecraft:donkey", "minecraft:mule", "minecraft:llama",
+			"minecraft:rabbit", "minecraft:mooshroom", "minecraft:camel", "minecraft:squid", "minecraft:bat");
+	/** The hostiles it may set on a player for a while, spared (ABI 54). */
+	private static final List<String> HOSTILE = List.of("minecraft:silverfish", "minecraft:cave_spider", "minecraft:wolf",
+			"minecraft:zombie", "minecraft:vex", "minecraft:phantom", "minecraft:creeper", "minecraft:killer_bunny");
+
+	/** An armour stand or a farm animal placed (ABI 27): for a while when seconds are given, wearing a kept stack when named. */
+	private static JsonObject placeEntity(ServerLevel level, JsonObject command, long id, Context context, WorldData data) {
+		String of = command.get("of").getAsString();
+		boolean targets = command.has("targets") && !command.get("targets").isJsonNull();
+		if (!PLACEABLE.contains(of) && !(HOSTILE.contains(of) && targets)) {
+			return report(id, false, "not something it places");
+		}
+		float wanted = command.has("seconds") ? command.get("seconds").getAsFloat() : 0;
+		if (HOSTILE.contains(of) && wanted <= 0) {
+			return report(id, false, "a hostile is only ever placed for a while");
+		}
+		// The killer bunny is the game's own rabbit of its evil kind (ABI 55).
+		boolean killer = of.equals("minecraft:killer_bunny");
+		Optional<Holder.Reference<net.minecraft.world.entity.EntityType<?>>> type = BuiltInRegistries.ENTITY_TYPE.get(Identifier.parse(killer ? "minecraft:rabbit" : of));
+		if (type.isEmpty()) {
+			return report(id, false, "no such entity");
+		}
+		// Never a mooshroom for a while: shorn, it turns into a cow that stays, and its mushrooms.
+		if (of.equals("minecraft:mooshroom") && command.has("seconds") && command.get("seconds").getAsFloat() > 0) {
+			return report(id, false, "a mooshroom is never placed for a while");
+		}
+		JsonArray p = command.getAsJsonArray("pos");
+		Vec3 pos = new Vec3(p.get(0).getAsDouble(), p.get(1).getAsDouble(), p.get(2).getAsDouble());
+		BlockPos at = BlockPos.containing(pos);
+		if (!level.getBlockState(at).getCollisionShape(level, at).isEmpty()) {
+			return report(id, false, "no room there");
+		}
+		Entity entity = type.get().value().create(level, net.minecraft.world.entity.EntitySpawnReason.MOB_SUMMONED);
+		if (entity == null) {
+			return report(id, false, "it could not be made");
+		}
+		if (killer) {
+			entity.setComponent(net.minecraft.core.component.DataComponents.RABBIT_VARIANT, net.minecraft.world.entity.animal.rabbit.Rabbit.Variant.EVIL);
+		}
+		float yaw = command.has("yaw") ? command.get("yaw").getAsFloat() : 0;
+		entity.snapTo(pos.x, pos.y, pos.z, yaw, 0);
+		entity.setYHeadRot(yaw);
+		if (command.has("kept") && !command.get("kept").getAsString().isEmpty() && entity instanceof net.minecraft.world.entity.LivingEntity living) {
+			ItemStack worn = data.giveBack(command.get("kept").getAsString());
+			if (worn != null && !worn.isEmpty()) {
+				living.setItemSlot(living.getEquipmentSlotForItem(worn), worn);
+			}
+		}
+		level.addFreshEntity(entity);
+		float seconds = command.has("seconds") ? command.get("seconds").getAsFloat() : 0;
+		ServerPlayer prey = targets ? context.senses().player(level, command.get("targets").getAsInt()) : null;
+		if (HOSTILE.contains(of)) {
+			if (prey == null || !(entity instanceof net.minecraft.world.entity.Mob hostile)) {
+				entity.discard();
+				return report(id, false, "the player is not here");
+			}
+			context.temporaries().addHostile(hostile, prey, seconds, command.has("harm") ? command.get("harm").getAsFloat() : 0);
+			// Dressed as asked: new, plain pieces, each in its slot, never dropped.
+			if (command.has("wears") && command.get("wears").isJsonArray()) {
+				for (JsonElement worn : command.getAsJsonArray("wears")) {
+					BuiltInRegistries.ITEM.get(Identifier.parse(worn.getAsString())).ifPresent(item -> {
+						ItemStack piece = new ItemStack(item.value());
+						net.minecraft.world.entity.EquipmentSlot slot = hostile.getEquipmentSlotForItem(piece);
+						hostile.setItemSlot(slot, piece);
+						hostile.setDropChance(slot, 0);
+					});
+				}
+			}
+		} else if (seconds > 0) {
+			context.temporaries().add(entity, seconds);
+			// A stand for a while wearing what it is given (ABI 55): unseen itself, the things on
+			// it never theirs to take, and it never breaks (`boots_at_the_door`).
+			if (entity instanceof net.minecraft.world.entity.decoration.ArmorStand stand && command.has("wears") && command.get("wears").isJsonArray()) {
+				for (JsonElement worn : command.getAsJsonArray("wears")) {
+					BuiltInRegistries.ITEM.get(Identifier.parse(worn.getAsString())).ifPresent(item -> {
+						ItemStack piece = new ItemStack(item.value());
+						stand.setItemSlot(stand.getEquipmentSlotForItem(piece), piece);
+					});
+				}
+				stand.setInvisible(true);
+				stand.setNoBasePlate(true);
+				stand.setPermanentlyInvulnerable(true);
+				try {
+					var disabled = net.minecraft.world.entity.decoration.ArmorStand.class.getDeclaredField("disabledSlots");
+					disabled.setAccessible(true);
+					disabled.setInt(stand, 0x3F3F3F);
+				} catch (ReflectiveOperationException e) {
+					// No lock on its slots: the stand goes rather than give anything away.
+					stand.discard();
+					return report(id, false, "its slots could not be locked");
+				}
+			}
+		}
+		// Still, facing a player, for its time (ABI 30: the shape under the water).
+		if (command.has("face") && !command.get("face").isJsonNull() && entity instanceof net.minecraft.world.entity.Mob mob) {
+			ServerPlayer facing = context.senses().player(level, command.get("face").getAsInt());
+			if (facing != null) {
+				context.holds().add(mob, facing, seconds > 0 ? seconds : 20);
+			}
+		}
+
+		return report(id, true, "");
+	}
+
+	/** A hive's bees out, held still around a place for a while, then home (ABI 27). */
+	private static JsonObject releaseBees(ServerLevel level, JsonObject command, long id, Context context) {
+		BlockPos hive = blockPos(command.getAsJsonArray("hive"));
+		if (!(level.getBlockEntity(hive) instanceof net.minecraft.world.level.block.entity.BeehiveBlockEntity beehive) || beehive.isEmpty()) {
+			return report(id, false, "no hive with bees there");
+		}
+		beehive.emptyAllLivingFromHive(null, level.getBlockState(hive), net.minecraft.world.level.block.entity.BeehiveBlockEntity.BeeReleaseStatus.BEE_RELEASED);
+		JsonArray p = command.getAsJsonArray("to");
+		Vec3 to = new Vec3(p.get(0).getAsDouble(), p.get(1).getAsDouble(), p.get(2).getAsDouble());
+		ServerPlayer nearest = level.getNearestPlayer(to.x, to.y, to.z, 64, false) instanceof ServerPlayer sp ? sp : null;
+		List<net.minecraft.world.entity.animal.bee.Bee> bees = level.getEntitiesOfClass(net.minecraft.world.entity.animal.bee.Bee.class,
+				new net.minecraft.world.phys.AABB(hive).inflate(3));
+		if (bees.isEmpty() || nearest == null) {
+			return report(id, false, bees.isEmpty() ? "no bee came out" : "no player near");
+		}
+		for (int i = 0; i < bees.size(); i++) {
+			double angle = i * Math.PI * 2 / bees.size();
+			bees.get(i).teleportTo(to.x + Math.cos(angle) * 1.2, to.y + (i % 2) * 0.4, to.z + Math.sin(angle) * 1.2);
+			context.holds().add(bees.get(i), nearest, command.get("seconds").getAsFloat());
+		}
+
+		return report(id, true, "");
+	}
+
+	/** An animal on a lead tied to another fence post within eight blocks of its own (ABI 27). */
+	private static JsonObject moveLeash(ServerLevel level, JsonObject command, long id) {
+		Entity entity = level.getEntity(command.get("entity").getAsInt());
+		if (!(entity instanceof net.minecraft.world.entity.Leashable leashable) || !leashable.isLeashed()
+				|| !(leashable.getLeashHolder() instanceof net.minecraft.world.entity.decoration.LeashFenceKnotEntity knot)) {
+			return report(id, false, "no animal tied to a post with that id here");
+		}
+		BlockPos post = knot.getPos();
+		// The nearest other post: a fence within eight blocks, two up or down.
+		BlockPos other = null;
+		for (BlockPos at : BlockPos.betweenClosed(post.offset(-8, -2, -8), post.offset(8, 2, 8))) {
+			if (!at.equals(post) && level.getBlockState(at).is(net.minecraft.tags.BlockTags.FENCES)
+					&& (other == null || at.distSqr(post) < other.distSqr(post))) {
+				other = at.immutable();
+			}
+		}
+		if (other == null) {
+			return report(id, false, "no other post near");
+		}
+		leashable.setLeashedTo(net.minecraft.world.entity.decoration.LeashFenceKnotEntity.getOrCreateKnot(level, other), true);
+		boolean stillHeld = !level.getEntitiesOfClass(net.minecraft.world.entity.Mob.class, knot.getBoundingBox().inflate(12),
+				m -> m instanceof net.minecraft.world.entity.Leashable l && l.getLeashHolder() == knot).isEmpty();
+		if (!stillHeld) {
+			knot.discard();
+		}
+
+		return report(id, true, "");
+	}
+
+	/** The figure digs into the rock ahead, on its player's client alone (ABI 35). */
+	private static JsonObject digIn(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		JsonArray way = command.getAsJsonArray("way");
+		Direction direction = Direction.getApproximateNearest(way.get(0).getAsInt(), 0, way.get(1).getAsInt());
+		boolean dug = context.figures().digIn(level, player, command.get("figure").getAsInt(), blockPos(command.getAsJsonArray("from")), direction,
+				command.has("through") && command.get("through").getAsBoolean());
+
+		return dug ? report(id, true, "") : report(id, false, "no rock face ahead");
+	}
+
+	/** The figure shown to a player swings once, perhaps a hit, never below half a heart with spare (ABI 33). */
+	/** A firework launched, its burst's shape and colours as asked (ABI 54). */
+	private static JsonObject firework(ServerLevel level, JsonObject command, long id) {
+		JsonArray pos = command.getAsJsonArray("pos");
+		var shape = switch (command.get("shape").getAsString()) {
+			case "small_ball" -> net.minecraft.world.item.component.FireworkExplosion.Shape.SMALL_BALL;
+			case "large_ball" -> net.minecraft.world.item.component.FireworkExplosion.Shape.LARGE_BALL;
+			case "star" -> net.minecraft.world.item.component.FireworkExplosion.Shape.STAR;
+			case "creeper" -> net.minecraft.world.item.component.FireworkExplosion.Shape.CREEPER;
+			case "burst" -> net.minecraft.world.item.component.FireworkExplosion.Shape.BURST;
+			default -> null;
+		};
+		if (shape == null) {
+			return report(id, false, "no such shape");
+		}
+		var colors = new it.unimi.dsi.fastutil.ints.IntArrayList();
+		command.getAsJsonArray("colors").forEach(c -> colors.add(c.getAsInt() & 0xFFFFFF));
+		if (colors.isEmpty()) {
+			colors.add(0xFFFFFF);
+		}
+		ItemStack rocket = new ItemStack(net.minecraft.world.item.Items.FIREWORK_ROCKET);
+		rocket.set(net.minecraft.core.component.DataComponents.FIREWORKS, new net.minecraft.world.item.component.Fireworks(
+				Math.max(1, Math.min(3, command.get("flight").getAsInt())),
+				List.of(new net.minecraft.world.item.component.FireworkExplosion(shape, colors, new it.unimi.dsi.fastutil.ints.IntArrayList(), false, false))));
+		level.addFreshEntity(new net.minecraft.world.entity.projectile.FireworkRocketEntity(level, pos.get(0).getAsDouble(), pos.get(1).getAsDouble(), pos.get(2).getAsDouble(), rocket));
+
+		return report(id, true, "");
+	}
+
+	/** A kept stack into a player's own ender chest, kept again when it is full (ABI 54). */
+	private static JsonObject putEnderChest(ServerLevel level, JsonObject command, long id, Context context, WorldData data) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		String kept = command.get("kept").getAsString();
+		ItemStack stack = data.giveBack(kept);
+		if (stack == null || stack.isEmpty()) {
+			return report(id, false, "nothing kept under that name");
+		}
+		ItemStack rest = player.getEnderChestInventory().addItem(stack);
+		if (!rest.isEmpty()) {
+			data.keep(kept, rest);
+			return report(id, false, "their ender chest is full");
+		}
+
+		return report(id, true, "");
+	}
+
+	/** A bed made a player's respawn point, quietly: no "Respawn point set" (ABI 54). */
+	private static JsonObject setRespawn(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		BlockPos pos = blockPos(command.getAsJsonArray("pos"));
+		if (!(level.getBlockState(pos).getBlock() instanceof net.minecraft.world.level.block.BedBlock)) {
+			return report(id, false, Senses.blockId(level.getBlockState(pos)) + " is no bed");
+		}
+		player.setRespawnPosition(new ServerPlayer.RespawnConfig(
+				net.minecraft.world.level.storage.LevelData.RespawnData.of(level.dimension(), pos, 0, 0), false), false);
+
+		return report(id, true, "");
+	}
+
+	/** The most a push moves a player each tick on an axis. */
+	static final double MOST_PUSH = 1;
+
+	/** A player pushed, once, as a hit or a current would (ABI 54): each axis at most a block a tick. */
+	private static JsonObject pushPlayer(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		JsonArray v = command.getAsJsonArray("velocity");
+		double x = Math.clamp(v.get(0).getAsDouble(), -MOST_PUSH, MOST_PUSH);
+		double y = Math.clamp(v.get(1).getAsDouble(), -MOST_PUSH, MOST_PUSH);
+		double z = Math.clamp(v.get(2).getAsDouble(), -MOST_PUSH, MOST_PUSH);
+		player.push(x, y, z);
+		// The player moves itself: the push is sent them, as a knockback is.
+		player.connection.send(new net.minecraft.network.protocol.game.ClientboundSetEntityMotionPacket(player));
+
+		return report(id, true, "");
+	}
+
+	/** A door held shut for a while, as if from the other side (ABI 54). */
+	private static JsonObject holdDoor(ServerLevel level, JsonObject command, long id, Context context) {
+		BlockPos pos = blockPos(command.getAsJsonArray("pos"));
+		BlockState state = level.getBlockState(pos);
+		if (!(state.getBlock() instanceof DoorBlock)) {
+			return report(id, false, Senses.blockId(state) + " is no door");
+		}
+		BlockPos lower = state.getValue(DoorBlock.HALF) == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.UPPER ? pos.below() : pos;
+		context.senses().holdDoor(lower, command.get("seconds").getAsFloat());
+
+		return report(id, true, "");
+	}
+
+	/** A figure chokes them where they lie, held asleep meanwhile (ABI 54). */
+	private static JsonObject choke(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		if (!player.isSleeping()) {
+			return report(id, false, "the player is not asleep");
+		}
+		ItemStack item = ItemStack.EMPTY;
+		String itemId = command.has("item") ? command.get("item").getAsString() : "";
+		if (!itemId.isEmpty()) {
+			Optional<Holder.Reference<Item>> kind = BuiltInRegistries.ITEM.get(Identifier.parse(itemId));
+			if (kind.isEmpty()) {
+				return report(id, false, "no such item");
+			}
+			item = new ItemStack(kind.get().value(), 1);
+		}
+		String how = command.has("how") ? command.get("how").getAsString() : "";
+		boolean held = context.figures().choke(player, command.get("figure").getAsInt(), item,
+				command.get("seconds").getAsFloat(), command.get("damage").getAsFloat(),
+				command.has("spare") && command.get("spare").getAsBoolean(), how);
+
+		if (!held) {
+			return report(id, false, "no figure shown with that number");
+		}
+		// The door it came in by: open, heard, and left open; anything else there now (the door
+		// gone since) is left alone and the choke goes on.
+		if (command.has("door")) {
+			BlockPos door = blockPos(command.getAsJsonArray("door"));
+			BlockState state = level.getBlockState(door);
+			if (state.getBlock() instanceof DoorBlock block && !block.isOpen(state)) {
+				block.setOpen(null, level, state, door, true);
+			}
+		}
+		// Their eyes kept open while it comes: the game's own fade to sleep held off on their
+		// client. Part of the scene, not a glitch: sent whatever events.glitches says.
+		context.sendHint().accept(player, new HintPayload("eyes_open", Optional.empty(), Figures.MOST_HOLD_SECONDS, ""));
+
+		return report(id, true, "");
+	}
+
+	private static JsonObject figureSwing(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		boolean swung = context.figures().swing(player, command.get("figure").getAsInt(), command.get("damage").getAsFloat(),
+				command.has("spare") && command.get("spare").getAsBoolean());
+
+		return swung ? report(id, true, "") : report(id, false, "no figure shown with that number");
+	}
+
+	/**
+	 * Blocks laid relative to a place (ABI 34): the ground found when the place's y is below
+	 * -1000 (the highest block that stops movement, leaves left out, water counting), and each
+	 * block only into air or over one of {@code replace}, never over contents. A door's lower
+	 * half goes in without telling its neighbours, so it does not break before its upper half.
+	 * Reports {@code base <y> placed <n>}.
+	 */
+	private static JsonObject placeBlueprint(ServerLevel level, JsonObject command, long id) {
+		JsonArray at = command.getAsJsonArray("at");
+		int x = at.get(0).getAsInt();
+		int y = at.get(1).getAsInt();
+		int z = at.get(2).getAsInt();
+		if (y <= -1000) {
+			BlockPos column = new BlockPos(x, 0, z);
+			if (!level.isLoaded(column)) {
+				return report(id, false, "the place is not loaded");
+			}
+			y = level.getHeightmapPos(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, column).getY() - 1;
+		}
+		List<String> replace = replaceable(command);
+		int placed = 0;
+		for (JsonElement element : command.getAsJsonArray("parts")) {
+			JsonObject part = element.getAsJsonObject();
+			JsonArray rel = part.getAsJsonArray("at");
+			BlockPos pos = new BlockPos(x + rel.get(0).getAsInt(), y + rel.get(1).getAsInt(), z + rel.get(2).getAsInt());
+			if (!level.isLoaded(pos) || taken(level, pos, replace, false) != null) {
+				continue;
+			}
+			Optional<Holder.Reference<Block>> block = BuiltInRegistries.BLOCK.get(Identifier.parse(part.get("block").getAsString()));
+			if (block.isEmpty()) {
+				continue;
+			}
+			BlockState state = withState(block.get().value().defaultBlockState(), part.has("state") ? part.get("state").getAsString() : "");
+			boolean lowerHalf = state.hasProperty(BlockStateProperties.DOUBLE_BLOCK_HALF)
+					&& state.getValue(BlockStateProperties.DOUBLE_BLOCK_HALF) == net.minecraft.world.level.block.state.properties.DoubleBlockHalf.LOWER;
+			level.setBlock(pos, state, lowerHalf ? Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE : placeFlags(state));
+			placed++;
+		}
+
+		return report(id, placed > 0, "base " + y + " placed " + placed);
+	}
+
+	/**
+	 * Each wall torch among {@code torches} turned on its block to point as nearly at
+	 * {@code toward} as a wall there lets it (ABI 55): its facing alone changed, lit as it was.
+	 */
+	private static JsonObject turnTorches(ServerLevel level, JsonObject command, long id) {
+		BlockPos toward = blockPos(command.getAsJsonArray("toward"));
+		Direction[] sides = {Direction.NORTH, Direction.SOUTH, Direction.WEST, Direction.EAST};
+		int turned = 0;
+		for (JsonElement element : command.getAsJsonArray("torches")) {
+			BlockPos pos = blockPos(element.getAsJsonArray());
+			if (!level.isLoaded(pos)) {
+				continue;
+			}
+			BlockState state = level.getBlockState(pos);
+			if (!(state.getBlock() instanceof net.minecraft.world.level.block.WallTorchBlock)) {
+				continue;
+			}
+			boolean[] holds = new boolean[4];
+			for (int i = 0; i < 4; i++) {
+				holds[i] = net.minecraft.world.level.block.WallTorchBlock.canSurvive(level, pos, sides[i]);
+			}
+			int best = Facing.nearestSide(toward.getX() - pos.getX(), toward.getZ() - pos.getZ(), holds);
+			if (best < 0 || sides[best] == state.getValue(net.minecraft.world.level.block.WallTorchBlock.FACING)) {
+				continue;
+			}
+			level.setBlock(pos, state.setValue(net.minecraft.world.level.block.WallTorchBlock.FACING, sides[best]), Block.UPDATE_ALL);
+			turned++;
+		}
+
+		return report(id, turned > 0, "turned " + turned);
+	}
+
+	/** A place from a command, on the ground there (a block and a half up) when its y is below -1000. */
+	private static Vec3 grounded(ServerLevel level, JsonArray p) {
+		double x = p.get(0).getAsDouble();
+		double y = p.get(1).getAsDouble();
+		double z = p.get(2).getAsDouble();
+		if (y <= -1000) {
+			y = level.getHeightmapPos(net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, BlockPos.containing(x, 0, z)).getY() + 1.5;
+		}
+		return new Vec3(x, y, z);
+	}
+
+	/** The effects a splash, a cloud or its brew may carry: none that harms (ABI 42). */
+	private static final java.util.Set<String> SPLASHES = java.util.Set.of("darkness", "slowness", "blindness", "nausea", "levitation");
+	private static final java.util.Set<String> CLOUDS = java.util.Set.of("slowness", "weakness");
+	/** The effects its brew may hold: none that harms or carries them anywhere (until now a list of the harmful let levitation and the rest through). */
+	private static final java.util.Set<String> BREWS = java.util.Set.of("night_vision", "darkness", "invisibility", "slowness", "weakness", "nausea", "glowing", "luck", "unluck", "water_breathing", "fire_resistance");
+	/** The kinds a potion of theirs may become: none that harms. */
+	private static final java.util.Set<String> SAFE_POTIONS = java.util.Set.of("night_vision", "invisibility", "water_breathing", "fire_resistance", "leaping", "swiftness", "slow_falling");
+
+	private static Optional<Holder.Reference<net.minecraft.world.effect.MobEffect>> effect(String name) {
+		return BuiltInRegistries.MOB_EFFECT.get(Identifier.withDefaultNamespace(name));
+	}
+
+	/** A real arrow from the dark, aimed as a skeleton aims; spared, never picked up, staying where it lands (ABI 42). */
+	private static JsonObject shoot(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		Vec3 from = grounded(level, command.getAsJsonArray("from"));
+		JsonArray a = command.getAsJsonArray("at");
+		Vec3 at = new Vec3(a.get(0).getAsDouble(), a.get(1).getAsDouble(), a.get(2).getAsDouble());
+		// Aimed where they are now, not where they stood when it was asked a second ago: at their
+		// chest, or a block and a third beside their head on the side it shoots from.
+		Vec3 eye = player.getEyePosition();
+		if (command.get("damage").getAsFloat() > 0) {
+			at = player.position().add(0, 1.1, 0);
+		} else {
+			Vec3 across = new Vec3(eye.z - from.z, 0, from.x - eye.x).normalize();
+			Vec3 side = at.subtract(eye).dot(across) >= 0 ? across : across.scale(-1);
+			at = eye.add(side.scale(1.3)).add(0, 0.1, 0);
+		}
+		var arrow = new net.minecraft.world.entity.projectile.arrow.Arrow(level, from.x, from.y, from.z, new ItemStack(net.minecraft.world.item.Items.ARROW), null);
+		arrow.pickup = net.minecraft.world.entity.projectile.arrow.AbstractArrow.Pickup.CREATIVE_ONLY;
+		float damage = Spare.arrowHarm(Math.max(0, command.get("damage").getAsFloat()), player.getHealth());
+		// An arrow's harm is its speed times its base: at 1.6, the base is the harm over 1.6.
+		arrow.setBaseDamage(damage / 1.6);
+		double dx = at.x - from.x;
+		double dz = at.z - from.z;
+		double dy = at.y - from.y;
+		arrow.shoot(dx, dy + Math.sqrt(dx * dx + dz * dz) * 0.2, dz, 1.6f, 0);
+		// It stays where it lands, to be found: never gone after a minute in the ground.
+		try {
+			java.lang.reflect.Field life = net.minecraft.world.entity.projectile.arrow.AbstractArrow.class.getDeclaredField("life");
+			life.setAccessible(true);
+			// Saved as a short: the least a short holds, about half an hour in the ground.
+			life.setInt(arrow, Short.MIN_VALUE);
+		} catch (ReflectiveOperationException | RuntimeException ignored) {
+			// The field moved: it goes after a minute, as any arrow does.
+		}
+		level.addFreshEntity(arrow);
+		level.playSound(null, from.x, from.y, from.z, net.minecraft.sounds.SoundEvents.ARROW_SHOOT, net.minecraft.sounds.SoundSource.HOSTILE, 0.8f, 1f);
+
+		return report(id, true, damage > 0 ? "aimed at them, " + damage : "aimed past them");
+	}
+
+	/** A splash potion of one effect thrown at their feet from the dark (ABI 42). */
+	private static JsonObject splashPotion(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		String name = command.get("effect").getAsString();
+		var effect = effect(name);
+		if (!SPLASHES.contains(name) || effect.isEmpty()) {
+			return report(id, false, "not an effect it throws");
+		}
+		float seconds = Math.max(0.5f, Math.min(command.get("seconds").getAsFloat(), name.equals("levitation") ? 2 : 15));
+		ItemStack potion = new ItemStack(net.minecraft.world.item.Items.SPLASH_POTION);
+		potion.set(net.minecraft.core.component.DataComponents.POTION_CONTENTS, new net.minecraft.world.item.alchemy.PotionContents(Optional.empty(), Optional.empty(),
+				List.of(new net.minecraft.world.effect.MobEffectInstance(effect.get(), (int) (seconds * 20))), Optional.empty()));
+		Vec3 from = grounded(level, command.getAsJsonArray("from"));
+		var thrown = new net.minecraft.world.entity.projectile.throwableitemprojectile.ThrownSplashPotion(level, from.x, from.y, from.z, potion);
+		double dx = player.getX() - from.x;
+		double dz = player.getZ() - from.z;
+		thrown.shoot(dx, player.getY() - from.y + Math.sqrt(dx * dx + dz * dz) * 0.2, dz, 0.75f, 0);
+		level.addFreshEntity(thrown);
+
+		return report(id, true, "");
+	}
+
+	/** Its brew, put into a container, named; nothing in it that harms (ABI 42). */
+	private static JsonObject putPotion(ServerLevel level, JsonObject command, long id) {
+		Container into = container(level, blockPos(command.getAsJsonArray("into")));
+		if (into == null) {
+			return report(id, false, "no container there");
+		}
+		List<net.minecraft.world.effect.MobEffectInstance> effects = new ArrayList<>();
+		for (JsonElement each : command.getAsJsonArray("effects")) {
+			JsonArray pair = each.getAsJsonArray();
+			String name = pair.get(0).getAsString();
+			var effect = effect(name);
+			if (!BREWS.contains(name) || effect.isEmpty()) {
+				return report(id, false, "not an effect it brews: " + name);
+			}
+			effects.add(new net.minecraft.world.effect.MobEffectInstance(effect.get(), (int) (Math.max(1, Math.min(pair.get(1).getAsFloat(), 600)) * 20)));
+		}
+		ItemStack potion = new ItemStack(net.minecraft.world.item.Items.POTION);
+		potion.set(net.minecraft.core.component.DataComponents.POTION_CONTENTS, new net.minecraft.world.item.alchemy.PotionContents(Optional.empty(), Optional.of(0x2B2234), effects, Optional.empty()));
+		potion.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME, Component.literal(command.get("name").getAsString()));
+		for (int slot = 0; slot < into.getContainerSize(); slot++) {
+			if (into.getItem(slot).isEmpty()) {
+				into.setItem(slot, potion);
+				into.setChanged();
+				return report(id, true, "");
+			}
+		}
+
+		return report(id, false, "the container is full");
+	}
+
+	/** A potion with an effect of its own: not water, nor the awkward, mundane or thick base. */
+	private static boolean realPotion(ItemStack stack) {
+		var contents = stack.get(net.minecraft.core.component.DataComponents.POTION_CONTENTS);
+		if (contents == null || contents.potion().isEmpty()) {
+			return false;
+		}
+		var potion = contents.potion().get();
+		return java.util.stream.Stream.of(net.minecraft.world.item.alchemy.Potions.WATER, net.minecraft.world.item.alchemy.Potions.AWKWARD,
+				net.minecraft.world.item.alchemy.Potions.MUNDANE, net.minecraft.world.item.alchemy.Potions.THICK).noneMatch(potion::equals);
+	}
+
+	/** A potion of theirs, another kind, its name kept (ABI 42). */
+	private static JsonObject changePotion(ServerLevel level, JsonObject command, long id) {
+		Container in = container(level, blockPos(command.getAsJsonArray("pos")));
+		int slot = command.get("slot").getAsInt();
+		if (in == null || slot < 0 || slot >= in.getContainerSize()) {
+			return report(id, false, "no such slot");
+		}
+		// A potion that is one: a bottle of water, or an awkward, mundane or thick one, made into
+		// a real potion was something of value from nothing. Another slot's real one, if any.
+		if (!realPotion(in.getItem(slot))) {
+			slot = -1;
+			for (int candidate = 0; candidate < in.getContainerSize(); candidate++) {
+				if (realPotion(in.getItem(candidate))) {
+					slot = candidate;
+					break;
+				}
+			}
+			if (slot < 0) {
+				return report(id, false, "no potion there, only bottles of water or a base");
+			}
+		}
+		ItemStack stack = in.getItem(slot);
+		var had = stack.get(net.minecraft.core.component.DataComponents.POTION_CONTENTS);
+		String into = command.get("into").getAsString();
+		var kind = BuiltInRegistries.POTION.get(Identifier.withDefaultNamespace(into));
+		if (had == null || !SAFE_POTIONS.contains(into) || kind.isEmpty()) {
+			return report(id, false, "no potion there, or not a kind it turns one into");
+		}
+		// Another kind than it is: the next safe one when asked for its own.
+		var asked = kind.get();
+		if (had.potion().filter(p -> p.equals(asked)).isPresent()) {
+			List<String> safe = new ArrayList<>(new java.util.TreeSet<>(SAFE_POTIONS));
+			String other = safe.get((safe.indexOf(into) + 1) % safe.size());
+			kind = BuiltInRegistries.POTION.get(Identifier.withDefaultNamespace(other));
+			if (kind.isEmpty()) {
+				return report(id, false, "no other kind");
+			}
+		}
+		Component name = stack.getHoverName();
+		stack.set(net.minecraft.core.component.DataComponents.POTION_CONTENTS, new net.minecraft.world.item.alchemy.PotionContents(kind.get()));
+		stack.set(net.minecraft.core.component.DataComponents.CUSTOM_NAME, name.copy().withStyle(s -> s.withItalic(false)));
+		in.setChanged();
+
+		return report(id, true, "");
+	}
+
+	/** A lingering cloud of one effect, gone as it first touches someone (ABI 42). */
+	private static JsonObject effectCloud(ServerLevel level, JsonObject command, long id) {
+		String name = command.get("effect").getAsString();
+		var effect = effect(name);
+		if (!CLOUDS.contains(name) || effect.isEmpty()) {
+			return report(id, false, "not an effect it leaves");
+		}
+		JsonArray p = command.getAsJsonArray("pos");
+		float radius = Math.max(0.5f, Math.min(command.get("radius").getAsFloat(), 3));
+		var cloud = new net.minecraft.world.entity.AreaEffectCloud(level, p.get(0).getAsDouble(), p.get(1).getAsDouble(), p.get(2).getAsDouble());
+		cloud.setRadius(radius);
+		cloud.setRadiusOnUse(-radius);
+		cloud.setWaitTime(0);
+		cloud.setDuration((int) (Math.min(command.get("seconds").getAsFloat(), 1200) * 20));
+		cloud.addEffect(new net.minecraft.world.effect.MobEffectInstance(effect.get(), 200));
+		level.addFreshEntity(cloud);
+
+		return report(id, true, "");
+	}
+
+	/** Every stack of a container dropped at a place, kept from despawning; with {@code remove} the empty container gone (ABI 41). */
+	private static JsonObject spillContainer(ServerLevel level, JsonObject command, long id) {
+		BlockPos from = blockPos(command.getAsJsonArray("from"));
+		Container container = container(level, from);
+		if (container == null) {
+			return report(id, false, "no container there");
+		}
+		JsonArray to = command.getAsJsonArray("to");
+		int spilled = 0;
+		for (int slot = 0; slot < container.getContainerSize(); slot++) {
+			ItemStack stack = container.removeItemNoUpdate(slot);
+			if (!stack.isEmpty()) {
+				ItemEntity entity = new ItemEntity(level, to.get(0).getAsDouble(), to.get(1).getAsDouble(), to.get(2).getAsDouble(), stack, 0, 0, 0);
+				entity.setUnlimitedLifetime();
+				level.addFreshEntity(entity);
+				spilled++;
+			}
+		}
+		container.setChanged();
+		if (command.has("remove") && command.get("remove").getAsBoolean()) {
+			level.removeBlockEntity(from);
+			level.setBlock(from, Blocks.AIR.defaultBlockState(), Block.UPDATE_ALL);
+		}
+
+		return report(id, true, "spilled " + spilled);
+	}
+
+	/** A Nether portal lit in an empty obsidian frame within six blocks, as flint and steel would (ABI 32). */
+	private static JsonObject lightPortal(ServerLevel level, JsonObject command, long id) {
+		BlockPos near = blockPos(command.getAsJsonArray("near"));
+		for (BlockPos at : BlockPos.betweenClosed(near.offset(-6, -6, -6), near.offset(6, 6, 6))) {
+			if (!level.getBlockState(at).isAir()) {
+				continue;
+			}
+			for (Direction.Axis axis : new Direction.Axis[] {Direction.Axis.X, Direction.Axis.Z}) {
+				var shape = net.minecraft.world.level.portal.PortalShape.findEmptyPortalShape(level, at.immutable(), axis);
+				if (shape.isPresent()) {
+					shape.get().createPortalBlocks(level);
+					level.playSound(null, at, net.minecraft.sounds.SoundEvents.FLINTANDSTEEL_USE, net.minecraft.sounds.SoundSource.BLOCKS, 1f, 1f);
+					return report(id, true, "");
+				}
+			}
+		}
+
+		return report(id, false, "no empty frame there");
+	}
+
+	/** The village emptied into one house till dawn (ABI 31). */
+	private static JsonObject gatherVillagers(ServerLevel level, JsonObject command, long id, Context context) {
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		int packed = context.gatherings().gather(level, blockPos(command.getAsJsonArray("center")), blockPos(command.getAsJsonArray("door")),
+				command.get("seconds").getAsFloat(), player, context.holds());
+
+		return packed > 0 ? report(id, true, "") : report(id, false, "no villager, or no room behind that door");
+	}
+
+	/** What it took, for sale at a villager for an emerald, once (ABI 31). */
+	private static JsonObject offerTrade(ServerLevel level, JsonObject command, long id, Context context, WorldData data) {
+		if (!(level.getEntity(command.get("entity").getAsInt()) instanceof net.minecraft.world.entity.npc.villager.AbstractVillager villager)) {
+			return report(id, false, "no villager with that id here");
+		}
+		ItemStack stack = data.giveBack(command.get("kept").getAsString());
+		if (stack == null || stack.isEmpty()) {
+			return report(id, false, "nothing kept under that name");
+		}
+		context.gatherings().sell(villager, stack);
+
+		return report(id, true, "");
+	}
+
+	/** An animal runs at a player and hits (ABI 27); with spare, never below half a heart. */
+	private static JsonObject charge(ServerLevel level, JsonObject command, long id, Context context) {
+		Entity entity = level.getEntity(command.get("entity").getAsInt());
+		if (!(entity instanceof net.minecraft.world.entity.animal.Animal animal)) {
+			return report(id, false, "no animal with that id here");
+		}
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		context.charges().add(animal, player, command.get("damage").getAsFloat(), command.get("hits").getAsInt(),
+				command.get("seconds").getAsFloat(), command.has("spare") && command.get("spare").getAsBoolean());
+
+		return report(id, true, "");
+	}
+
+	/** An animal warped for a while and put back (ABI 25): only an animal, never a held mob or one already warped. */
+	private static JsonObject warpMob(ServerLevel level, JsonObject command, long id, Context context) {
+		Entity entity = level.getEntity(command.get("entity").getAsInt());
+		if (!(entity instanceof net.minecraft.world.entity.animal.Animal animal)) {
+			return report(id, false, "no animal with that id here");
+		}
+		ServerPlayer player = context.senses().player(level, command.get("player").getAsInt());
+		if (player == null) {
+			return report(id, false, "the player is not here");
+		}
+		Vec3 to = null;
+		if (command.has("to") && command.get("to").isJsonArray()) {
+			JsonArray p = command.getAsJsonArray("to");
+			to = new Vec3(p.get(0).getAsDouble(), p.get(1).getAsDouble(), p.get(2).getAsDouble());
+		}
+		boolean warped = context.warps().add(animal, player, command.get("seconds").getAsFloat(),
+				command.has("scale") ? command.get("scale").getAsDouble() : 1.0,
+				command.has("flip") && command.get("flip").getAsBoolean(),
+				command.has("creep") && command.get("creep").getAsBoolean(), to);
+
+		return warped ? report(id, true, "") : report(id, false, "it is held or warped already");
+	}
+
+	private static Container container(ServerLevel level, BlockPos pos) {
+		BlockEntity entity = level.getBlockEntity(pos);
+
+		return entity instanceof Container container ? container : null;
+	}
+
+	static BlockPos blockPos(JsonArray array) {
+		return new BlockPos(array.get(0).getAsInt(), array.get(1).getAsInt(), array.get(2).getAsInt());
+	}
+
+	static JsonObject report(long id, boolean done, String reason) {
+		JsonObject report = new JsonObject();
+		report.addProperty("id", id);
+		report.addProperty("done", done);
+		report.addProperty("reason", reason);
+
+		return report;
+	}
+}

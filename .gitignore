@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+host/.gradle/
+host/build/
+host/**/build/
+.DS_Store
